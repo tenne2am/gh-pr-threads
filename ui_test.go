@@ -796,3 +796,146 @@ func TestChecksViewScrolls(t *testing.T) {
 		t.Error("the selected check should be on screen")
 	}
 }
+
+// rerunFixture: CI #7 (run 42) has finished with one failure, Deploy #3
+// (run 43) is still going, and ci/jenkins is not an Actions check.
+func rerunFixture() []Check {
+	return []Check{
+		{Workflow: "CI", Name: "test", State: CheckFail, JobID: 2, RunID: 42, RunNumber: 7},
+		{Workflow: "Deploy", Name: "ship", State: CheckPending, JobID: 5, RunID: 43, RunNumber: 3},
+		{Workflow: "CI", Name: "lint", State: CheckPass, JobID: 1, RunID: 42, RunNumber: 7},
+		{Workflow: "Deploy", Name: "build", State: CheckPass, JobID: 4, RunID: 43, RunNumber: 3},
+		{Name: "ci/jenkins", State: CheckPass},
+	}
+}
+
+// checksAt opens the checks view with the cursor on the check with label.
+func checksAt(t *testing.T, m model, label string) model {
+	t.Helper()
+	m = key(m, "w")
+	for i, c := range m.checks {
+		if c.Label() == label {
+			m.checkCursor = i
+			return m
+		}
+	}
+	t.Fatalf("no check %q", label)
+	return m
+}
+
+func TestRerunAsksBeforeRunning(t *testing.T) {
+	cases := []struct{ key, prompt string }{
+		{"r", "Re-run CI / test? (y/n)"},
+		{"f", "Re-run failed jobs of CI #7? (y/n)"},
+		{"A", "Re-run all jobs of CI #7? (y/n)"},
+	}
+	for _, c := range cases {
+		m := checksAt(t, withChecks(t, rerunFixture()), "CI / test")
+		n, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(c.key)})
+		m = n.(model)
+		if cmd != nil {
+			t.Errorf("%s must not re-run before confirming", c.key)
+		}
+		if v := m.View(); !strings.Contains(v, c.prompt) {
+			t.Errorf("%s: footer should ask %q\n---\n%s", c.key, c.prompt, v)
+		}
+	}
+}
+
+func TestRerunDeclined(t *testing.T) {
+	m := key(checksAt(t, withChecks(t, rerunFixture()), "CI / test"), "r")
+	for _, k := range []string{"n", "j"} { // anything but y declines
+		n, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)})
+		got := n.(model)
+		if cmd != nil || got.confirm != nil {
+			t.Errorf("%q should cancel without re-running", k)
+		}
+		if !strings.Contains(got.View(), "re-run cancelled") {
+			t.Errorf("%q: expected a cancellation notice", k)
+		}
+		if got.checkCursor != m.checkCursor {
+			t.Errorf("%q answered the prompt; it must not also move the cursor", k)
+		}
+	}
+}
+
+func TestRerunGuards(t *testing.T) {
+	cases := []struct{ label, key, warning string }{
+		{"ci/jenkins", "r", "ci/jenkins is not a GitHub Actions job"},
+		{"Deploy / build", "r", "Deploy #3 is still running"}, // finished job, unfinished run
+		{"Deploy / ship", "A", "Deploy #3 is still running"},
+		{"CI / lint", "f", ""}, // CI #7 has a failure elsewhere in the run: allowed
+	}
+	for _, c := range cases {
+		m := key(checksAt(t, withChecks(t, rerunFixture()), c.label), c.key)
+		if c.warning == "" {
+			if m.confirm == nil {
+				t.Errorf("%s %s: should ask to confirm", c.key, c.label)
+			}
+			continue
+		}
+		if m.confirm != nil {
+			t.Errorf("%s %s: should not offer the re-run", c.key, c.label)
+		}
+		if v := m.View(); !strings.Contains(v, c.warning) {
+			t.Errorf("%s %s: want warning %q\n---\n%s", c.key, c.label, c.warning, v)
+		}
+	}
+
+	allGreen := []Check{{Workflow: "CI", Name: "lint", State: CheckPass, JobID: 1, RunID: 42, RunNumber: 7}}
+	m := key(checksAt(t, withChecks(t, allGreen), "CI / lint"), "f")
+	if m.confirm != nil || !strings.Contains(m.View(), "CI #7 has no failed jobs") {
+		t.Errorf("f on a run without failures should warn, got:\n%s", m.View())
+	}
+}
+
+func TestRerunConfirmedPostsAndRefreshes(t *testing.T) {
+	client, fake := fakeClient(t)
+	m := withChecks(t, rerunFixture())
+	m.client = client
+	m = key(checksAt(t, m, "CI / test"), "f")
+
+	n, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	m = n.(model)
+	if !strings.Contains(m.View(), "re-running failed jobs of CI #7") {
+		t.Errorf("expected progress in the footer, got:\n%s", m.View())
+	}
+	n, follow := m.Update(cmd())
+	m = n.(model)
+	if follow == nil {
+		t.Error("a successful re-run should schedule a refresh of the checks")
+	}
+	if len(fake.rest) != 1 || fake.rest[0] != "POST /repos/o/r/actions/runs/42/rerun-failed-jobs" {
+		t.Errorf("requests = %q", fake.rest)
+	}
+	if !strings.Contains(m.View(), "re-run requested: failed jobs of CI #7") {
+		t.Errorf("expected a confirmation, got:\n%s", m.View())
+	}
+
+	// After the delay the checks are refetched, without blanking the view.
+	n, cmd = m.Update(refreshChecksMsg{})
+	if cmd == nil {
+		t.Fatal("refreshChecksMsg should refetch the checks")
+	}
+	if !n.(model).checksLoaded {
+		t.Error("the delayed refresh should keep showing the current checks")
+	}
+}
+
+func TestRerunFailureShown(t *testing.T) {
+	client, fake := fakeClient(t)
+	fake.restStatus = 403
+	fake.restBody = `{"message":"Must have admin rights to Repository."}`
+	m := withChecks(t, rerunFixture())
+	m.client = client
+	m = key(checksAt(t, m, "CI / test"), "r")
+	n, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	m = n.(model)
+	n, follow := m.Update(cmd())
+	if follow != nil {
+		t.Error("a failed re-run should not schedule a refresh")
+	}
+	if v := n.(model).View(); !strings.Contains(v, "Must have admin rights to Repository.") {
+		t.Errorf("expected GitHub's error in the footer, got:\n%s", v)
+	}
+}

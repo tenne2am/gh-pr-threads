@@ -20,14 +20,28 @@ type graphQLRequest struct {
 }
 
 // fakeGitHub answers every GraphQL request with the next canned response and
-// records the requests so tests can inspect what would have been sent.
+// records the requests so tests can inspect what would have been sent. REST
+// calls are recorded as "METHOD /path" and answered with restStatus/restBody.
 type fakeGitHub struct {
 	t         *testing.T
 	responses []string
 	requests  []graphQLRequest
+
+	rest       []string
+	restStatus int
+	restBody   string
 }
 
 func (f *fakeGitHub) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.URL.Path != "/graphql" {
+		f.rest = append(f.rest, r.Method+" "+r.URL.Path)
+		return &http.Response{
+			StatusCode: f.restStatus,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(bytes.NewBufferString(f.restBody)),
+			Request:    r,
+		}, nil
+	}
 	var req graphQLRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		f.t.Fatalf("decoding request: %v", err)
@@ -48,16 +62,21 @@ func (f *fakeGitHub) RoundTrip(r *http.Request) (*http.Response, error) {
 
 func fakeClient(t *testing.T, responses ...string) (*Client, *fakeGitHub) {
 	t.Helper()
-	fake := &fakeGitHub{t: t, responses: responses}
-	gql, err := api.NewGraphQLClient(api.ClientOptions{
+	fake := &fakeGitHub{t: t, responses: responses, restStatus: http.StatusCreated}
+	opts := api.ClientOptions{
 		Host:      "github.com",
 		AuthToken: "test-token",
 		Transport: fake,
-	})
+	}
+	gql, err := api.NewGraphQLClient(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &Client{gql: gql}, fake
+	rest, err := api.NewRESTClient(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Client{gql: gql, rest: rest}, fake
 }
 
 const threadsJSON = `{"data":{"repository":{"pullRequest":{
@@ -252,5 +271,56 @@ func TestCheckLabel(t *testing.T) {
 	}
 	if got := (Check{Name: "ci/jenkins"}).Label(); got != "ci/jenkins" {
 		t.Errorf("Label() = %q", got)
+	}
+}
+
+func TestChecksCarryActionsIDs(t *testing.T) {
+	client, _ := fakeClient(t, checksPage(`
+	  {"__typename":"CheckRun","databaseId":2002,"name":"test","status":"COMPLETED","conclusion":"FAILURE",
+	   "checkSuite":{"workflowRun":{"databaseId":42,"runNumber":7,"event":"pull_request","workflow":{"name":"CI"}}}},
+	  {"__typename":"CheckRun","databaseId":3003,"name":"external","status":"COMPLETED","conclusion":"SUCCESS",
+	   "checkSuite":{"workflowRun":null}}`, false))
+	_, checks, err := client.Checks("o", "r", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := checks[0]; c.JobID != 2002 || c.RunID != 42 || c.RunNumber != 7 {
+		t.Errorf("Actions job IDs = job %d run %d #%d, want job 2002 run 42 #7", c.JobID, c.RunID, c.RunNumber)
+	}
+	// A check run from another app has no workflow run to re-run.
+	if c := checks[1]; c.JobID != 0 || c.RunID != 0 {
+		t.Errorf("non-Actions check got IDs job %d run %d; Rerun must not be offered", c.JobID, c.RunID)
+	}
+}
+
+func TestRerunEndpoints(t *testing.T) {
+	check := Check{JobID: 2002, RunID: 42}
+	cases := []struct {
+		scope RerunScope
+		want  string
+	}{
+		{RerunJob, "POST /repos/o/r/actions/jobs/2002/rerun"},
+		{RerunFailed, "POST /repos/o/r/actions/runs/42/rerun-failed-jobs"},
+		{RerunAll, "POST /repos/o/r/actions/runs/42/rerun"},
+	}
+	for _, c := range cases {
+		client, fake := fakeClient(t)
+		// GitHub answers 201 with an empty body; that must count as success.
+		if err := client.Rerun("o", "r", check, c.scope); err != nil {
+			t.Errorf("scope %d: %v", c.scope, err)
+		}
+		if len(fake.rest) != 1 || fake.rest[0] != c.want {
+			t.Errorf("scope %d: requests = %q, want [%q]", c.scope, fake.rest, c.want)
+		}
+	}
+}
+
+func TestRerunError(t *testing.T) {
+	client, fake := fakeClient(t)
+	fake.restStatus = http.StatusForbidden
+	fake.restBody = `{"message":"Resource not accessible by integration"}`
+	err := client.Rerun("o", "r", Check{JobID: 1, RunID: 2}, RerunJob)
+	if err == nil || !strings.Contains(err.Error(), "re-running") || !strings.Contains(err.Error(), "Resource not accessible by integration") {
+		t.Errorf("err = %v, want GitHub's message wrapped", err)
 	}
 }

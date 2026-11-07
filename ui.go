@@ -47,6 +47,14 @@ type checksMsg struct {
 	err    error
 }
 
+type rerunMsg struct {
+	req rerunRequest
+	err error
+}
+
+// refreshChecksMsg refetches the checks without blanking the view.
+type refreshChecksMsg struct{}
+
 type errMsg struct{ err error }
 
 // --- styles -----------------------------------------------------------------
@@ -97,6 +105,7 @@ type model struct {
 	checksErr    error
 	checkCursor  int
 	checkOffset  int
+	confirm      *rerunRequest // a re-run waiting for y/n
 	status       string
 	err          error
 
@@ -153,6 +162,16 @@ func (m model) checksCmd() tea.Cmd {
 		return checksMsg{sha: sha, checks: checks, err: err}
 	}
 }
+
+func (m model) rerunCmd(req rerunRequest) tea.Cmd {
+	return func() tea.Msg {
+		return rerunMsg{req: req, err: m.client.Rerun(m.owner, m.repo, req.check, req.scope)}
+	}
+}
+
+// rerunRefreshDelay gives GitHub a moment to queue the new attempt before the
+// checks are fetched again, so the refresh shows it.
+const rerunRefreshDelay = 2 * time.Second
 
 func (m model) replyCmd(threadID, body string) tea.Cmd {
 	return func() tea.Msg {
@@ -222,6 +241,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refilter()
 		m.renderDetail()
 		return m, nil
+
+	case rerunMsg:
+		if msg.err != nil {
+			m.status = errStyle.Render("! " + msg.err.Error())
+			return m, nil
+		}
+		m.status = okStyle.Render("✓ re-run requested: " + msg.req.target())
+		return m, tea.Tick(rerunRefreshDelay, func(time.Time) tea.Msg { return refreshChecksMsg{} })
+
+	case refreshChecksMsg:
+		return m, m.checksCmd()
 
 	case checksMsg:
 		m.checksLoaded = true
@@ -444,6 +474,17 @@ func (m model) updateDiff(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // updateChecks handles keys on the checks view.
 func (m model) updateChecks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.confirm != nil {
+		req := *m.confirm
+		m.confirm = nil
+		if msg.String() == "y" || msg.String() == "Y" {
+			m.status = dimStyle.Render("re-running " + req.target() + "...")
+			return m, m.rerunCmd(req)
+		}
+		m.status = dimStyle.Render("re-run cancelled")
+		return m, nil
+	}
+
 	switch msg.String() {
 	case "ctrl+c":
 		return m, tea.Quit
@@ -465,9 +506,63 @@ func (m model) updateChecks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.checksLoaded = false
 		m.status = ""
 		return m, m.checksCmd()
+	case "r", "f", "A":
+		if m.checkCursor < len(m.checks) {
+			scope := map[string]RerunScope{"r": RerunJob, "f": RerunFailed, "A": RerunAll}[msg.String()]
+			m.askRerun(rerunRequest{scope: scope, check: m.checks[m.checkCursor]})
+		}
 	}
 	m.clampCheckOffset()
 	return m, nil
+}
+
+// rerunRequest is a re-run the user asked for, before and after confirming.
+type rerunRequest struct {
+	scope RerunScope
+	check Check
+}
+
+// target names what will re-run, e.g. "CI / test" or "failed jobs of CI #42".
+func (r rerunRequest) target() string {
+	run := fmt.Sprintf("%s #%d", r.check.Workflow, r.check.RunNumber)
+	switch r.scope {
+	case RerunJob:
+		return r.check.Label()
+	case RerunFailed:
+		return "failed jobs of " + run
+	default:
+		return "all jobs of " + run
+	}
+}
+
+// askRerun checks a re-run can work before asking to confirm it, so the
+// common mistakes get a clear message instead of an API error.
+func (m *model) askRerun(req rerunRequest) {
+	c := req.check
+	if c.RunID == 0 {
+		m.status = warnStyle.Render("! " + c.Label() + " is not a GitHub Actions job; re-run it from its own CI")
+		return
+	}
+	// The checks list holds every job of the run, so it can tell whether the
+	// run is still going and whether anything in it failed.
+	var running, failed bool
+	for _, other := range m.checks {
+		if other.RunID != c.RunID {
+			continue
+		}
+		running = running || other.State == CheckPending
+		failed = failed || other.State == CheckFail
+	}
+	switch {
+	case running: // GitHub refuses any re-run until the whole run has finished
+		m.status = warnStyle.Render(fmt.Sprintf("! %s #%d is still running", c.Workflow, c.RunNumber))
+		return
+	case req.scope == RerunFailed && !failed:
+		m.status = warnStyle.Render(fmt.Sprintf("! %s #%d has no failed jobs", c.Workflow, c.RunNumber))
+		return
+	}
+	m.status = ""
+	m.confirm = &req
 }
 
 // openURL opens url in the browser, reporting failures in the footer.
@@ -1060,6 +1155,10 @@ func (m model) viewReply() string {
 }
 
 func (m model) viewFooter() string {
+	if m.confirm != nil {
+		prompt := "Re-run " + m.confirm.target() + "? (y/n)"
+		return warnStyle.Render(truncate(prompt, m.width))
+	}
 	if m.status != "" {
 		return lipgloss.NewStyle().MaxWidth(m.width).Render(m.status)
 	}
@@ -1070,7 +1169,7 @@ func (m model) viewFooter() string {
 	case modeDiff:
 		keys = "j/k extend selection · space restart here · d full hunk · enter quote+reply · esc back"
 	case modeChecks:
-		keys = "j/k move · o open run · R refresh checks · esc back"
+		keys = "j/k move · o open run · r re-run job · f re-run failed · A re-run all · R refresh · esc back"
 		if m.checksSHA != "" {
 			keys = "checks on " + m.checksSHA[:min(7, len(m.checksSHA))] + " · " + keys
 		}

@@ -118,17 +118,39 @@ apps' check runs, and commit statuses from external CI.
 ✓ CI / lint                                    success · 42s
 ✓ ci/jenkins                                    Build passed
 - PR Triaging / label                                skipped
-checks on abc1234 · j/k move · o open run · R refresh checks · esc back
+checks on abc1234 · j/k move · o open run · r re-run job · f re-run failed · A re-run all · R refresh · esc back
 ```
 
 * Failing checks come first, then pending, passed and skipped, each sorted by name.
 * Each row shows GitHub's own state (`failure`, `cancelled`, `timed out`, `queued`, …)
   and how long the job took, or how long it has been running.
 * `o` (or `enter`) opens the selected run's page — its logs — on github.com.
-* `R` re-fetches the checks, e.g. after a re-run; `R` in the thread view refreshes both.
+* `R` re-fetches the checks; `R` in the thread view refreshes both.
 * The checks are fetched separately from the threads, so if they can't be read (for
   example a token without access to the repository's Actions), the error shows in the
   checks view and the threads keep working.
+
+### Re-running workflows
+
+From the checks view you can re-run GitHub Actions, like the buttons on a workflow
+run's page:
+
+| Key | Re-runs |
+| --- | --- |
+| `r` | the selected job |
+| `f` | the failed jobs of the selected job's workflow run |
+| `A` | every job of that workflow run |
+
+* Each asks first, naming what will run, e.g. `Re-run failed jobs of CI #42? (y/n)`.
+  `y` goes ahead; any other key cancels.
+* About two seconds after GitHub accepts the re-run, the checks refresh by themselves,
+  so the restarted jobs show up as queued.
+* Some re-runs are refused up front with a message instead of an API error: checks
+  that aren't GitHub Actions jobs (external CI statuses and other apps' check runs),
+  runs that are still in progress (GitHub only re-runs finished runs, even for a single
+  job), and `f` on a run with no failed jobs.
+* Re-running needs write access to the repository's Actions; if the token lacks it,
+  GitHub's error is shown in the footer.
 
 ## Keys
 
@@ -169,6 +191,9 @@ checks on abc1234 · j/k move · o open run · R refresh checks · esc back
 | `j` / `k`, `↓` / `↑` | move between checks |
 | `g` / `G`, `home` / `end` | first / last check |
 | `o`, `enter` | open the run on github.com |
+| `r` | re-run the selected job |
+| `f` | re-run the failed jobs of its workflow run |
+| `A` | re-run all jobs of its workflow run |
 | `R`, `ctrl+r` | refresh the checks |
 | `esc`, `w`, `q` | back to the threads |
 
@@ -209,7 +234,8 @@ and read the screen. API calls go to an in-process mock of the GitHub GraphQL AP
 go-gh talks to the development host `github.localhost` over plain HTTP, so
 `GH_HOST=github.localhost` plus `HTTP_PROXY` pointing at the mock routes every request
 there, with no test hooks in the extension. The mock keeps state (replies and
-resolutions show up on reload, checks can be changed between refreshes) and, like
+resolutions show up on reload, checks can be changed between refreshes, and the
+re-run REST endpoints queue the jobs they restart) and, like
 GitHub, only returns `diffHunk` when the query asks for it. A stand-in `gh` (via
 `GH_PATH`) covers finding the current branch's PR, and a stand-in browser (via
 `GH_BROWSER`) records the URLs `o` opens.
@@ -230,6 +256,10 @@ They need a Unix-like OS for the pseudo-terminal.
   `CheckRun` (GitHub Actions jobs carry their workflow via `checkSuite.workflowRun`) and
   `StatusContext`. Conclusions are bucketed into fail / pending / pass / skipped the way
   `gh pr checks` does.
+* Re-runs use the REST endpoints `actions/jobs/{id}/rerun`,
+  `actions/runs/{id}/rerun-failed-jobs` and `actions/runs/{id}/rerun`; GraphQL has no
+  equivalent. The job and run IDs come from `CheckRun.databaseId` and
+  `workflowRun.databaseId` rather than being parsed out of URLs.
 * Replies use the `addPullRequestReviewThreadReply` mutation; resolving uses
   `resolveReviewThread` / `unresolveReviewThread`.
 * The TUI is [Bubble Tea](https://github.com/charmbracelet/bubbletea) — the same stack

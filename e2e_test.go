@@ -61,24 +61,51 @@ type mockGitHub struct {
 	requests   []graphQLRequest
 	failReply  bool
 	failChecks bool
+	failRerun  bool
+	reruns     []string // "POST /repos/..." re-run calls received
 	nextID     int
 
 	headSHA string
 	checks  []map[string]interface{} // raw CheckRun / StatusContext nodes
 }
 
+// checkRun builds an Actions job node. Its job and run IDs come from the
+// .../actions/runs/{run}/job/{job} URL, as on GitHub; the run number is the
+// run ID plus 100 so the two can't be confused.
 func checkRun(workflow, name, status, conclusion, url string) map[string]interface{} {
+	var runID, jobID int64
+	if _, err := fmt.Sscanf(url[strings.Index(url, "/runs/"):], "/runs/%d/job/%d", &runID, &jobID); err != nil {
+		panic("checkRun needs an actions job URL: " + url)
+	}
 	run := map[string]interface{}{
-		"__typename": "CheckRun", "name": name, "status": status, "detailsUrl": url,
-		"startedAt": "2026-09-01T10:00:00Z", "completedAt": nil, "conclusion": nil,
+		"__typename": "CheckRun", "databaseId": jobID, "name": name, "detailsUrl": url,
+		"startedAt": "2026-09-01T10:00:00Z",
 		"checkSuite": map[string]interface{}{"workflowRun": map[string]interface{}{
+			"databaseId": runID, "runNumber": runID + 100,
 			"event": "pull_request", "workflow": map[string]interface{}{"name": workflow}}},
 	}
+	setStatus(run, status, conclusion)
+	return run
+}
+
+func setStatus(run map[string]interface{}, status, conclusion string) {
+	run["status"], run["conclusion"], run["completedAt"] = status, nil, nil
 	if status == "COMPLETED" {
 		run["conclusion"] = conclusion
 		run["completedAt"] = "2026-09-01T10:03:12Z"
 	}
-	return run
+}
+
+func jobID(run map[string]interface{}) int64 { id, _ := run["databaseId"].(int64); return id }
+
+func runID(run map[string]interface{}) int64 {
+	if suite, ok := run["checkSuite"].(map[string]interface{}); ok {
+		if wr, ok := suite["workflowRun"].(map[string]interface{}); ok {
+			id, _ := wr["databaseId"].(int64)
+			return id
+		}
+	}
+	return 0
 }
 
 func newMockGitHub(t *testing.T) *mockGitHub {
@@ -110,7 +137,13 @@ func newMockGitHub(t *testing.T) *mockGitHub {
 	}
 }
 
+var rerunPath = regexp.MustCompile(`^/repos/octo/demo/actions/(jobs|runs)/(\d+)/(rerun|rerun-failed-jobs)$`)
+
 func (g *mockGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Host == "api.github.localhost" && r.Method == http.MethodPost && rerunPath.MatchString(r.URL.Path) {
+		g.serveRerun(w, r)
+		return
+	}
 	if r.Host != "api.github.localhost" || r.URL.Path != "/graphql" {
 		g.t.Errorf("unexpected request %s %s%s", r.Method, r.Host, r.URL.Path)
 		http.Error(w, "not found", http.StatusNotFound)
@@ -192,6 +225,39 @@ func (g *mockGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]interface{}{"data": data})
+}
+
+// serveRerun queues the jobs a re-run endpoint would restart, like GitHub.
+func (g *mockGitHub) serveRerun(w http.ResponseWriter, r *http.Request) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.reruns = append(g.reruns, r.Method+" "+r.URL.Path)
+	if g.failRerun {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"message":"Must have admin rights to Repository."}`))
+		return
+	}
+
+	m := rerunPath.FindStringSubmatch(r.URL.Path)
+	var id int64
+	fmt.Sscan(m[2], &id)
+	for _, run := range g.checks {
+		var restart bool
+		switch {
+		case m[1] == "jobs":
+			restart = jobID(run) == id
+		case m[3] == "rerun-failed-jobs":
+			restart = runID(run) == id && run["conclusion"] != "SUCCESS" && run["conclusion"] != "SKIPPED"
+		default:
+			restart = runID(run) == id
+		}
+		if restart {
+			setStatus(run, "QUEUED", "")
+		}
+	}
+	// GitHub answers 201 Created with nothing worth reading.
+	w.WriteHeader(http.StatusCreated)
 }
 
 func withoutHunks(threads []Thread) []Thread {
@@ -567,6 +633,99 @@ func TestE2EChecksErrorKeepsThreadsWorking(t *testing.T) {
 	term.expect("checks not available to mock token")
 	term.send(keyEsc)
 	term.expect("this needs a nil check")
+}
+
+// rerunChecks is a finished CI run (#142) with one failure, plus a separate
+// green Lint run (#143).
+func rerunChecks() []map[string]interface{} {
+	return []map[string]interface{}{
+		checkRun("CI", "lint", "COMPLETED", "SUCCESS", "https://github.com/octo/demo/actions/runs/42/job/1"),
+		checkRun("CI", "test", "COMPLETED", "FAILURE", "https://github.com/octo/demo/actions/runs/42/job/2"),
+		checkRun("Lint", "vet", "COMPLETED", "SUCCESS", "https://github.com/octo/demo/actions/runs/43/job/3"),
+	}
+}
+
+func TestE2ERerunFailedJobs(t *testing.T) {
+	gh := newMockGitHub(t)
+	gh.checks = rerunChecks()
+	term := startApp(t, gh, []string{"7", "--repo", "octo/demo"})
+	term.expect("✗ 1 failing")
+	term.send("w")
+	term.expect("✗ CI / test")
+
+	// Declining sends nothing.
+	term.send("r")
+	term.expect("Re-run CI / test? (y/n)")
+	term.send("n")
+	term.expect("re-run cancelled")
+
+	term.send("f")
+	term.expect("Re-run failed jobs of CI #142? (y/n)")
+	term.send("y")
+	term.expect("re-run requested: failed jobs of CI #142")
+
+	gh.mu.Lock()
+	reruns := append([]string(nil), gh.reruns...)
+	gh.mu.Unlock()
+	if want := "POST /repos/octo/demo/actions/runs/42/rerun-failed-jobs"; len(reruns) != 1 || reruns[0] != want {
+		t.Errorf("re-run calls = %q, want [%q]", reruns, want)
+	}
+
+	// The checks refresh on their own shortly after, showing the queued job.
+	term.expect("● 1 pending")
+	term.expect("queued")
+	gh.mu.Lock()
+	defer gh.mu.Unlock()
+	if s := gh.checks[0]["status"]; s != "COMPLETED" {
+		t.Errorf("the passing job in the same run was restarted (status %v)", s)
+	}
+}
+
+func TestE2ERerunWholeRunAndSingleJob(t *testing.T) {
+	gh := newMockGitHub(t)
+	gh.checks = rerunChecks()
+	term := startApp(t, gh, []string{"7", "--repo", "octo/demo"})
+	term.expect("✗ 1 failing")
+	term.send("w")
+	term.expect("✗ CI / test")
+
+	term.send("G") // Lint / vet, a run of its own
+	term.expect("Lint / vet")
+	term.send("r")
+	term.expect("Re-run Lint / vet? (y/n)")
+	term.send("y")
+	term.expect("re-run requested: Lint / vet")
+
+	term.send("g")
+	term.expect("CI / test")
+	term.send("A")
+	term.expect("Re-run all jobs of CI #142? (y/n)")
+	term.send("y")
+	term.expect("re-run requested: all jobs of CI #142")
+
+	gh.mu.Lock()
+	defer gh.mu.Unlock()
+	want := []string{
+		"POST /repos/octo/demo/actions/jobs/3/rerun",
+		"POST /repos/octo/demo/actions/runs/42/rerun",
+	}
+	if strings.Join(gh.reruns, ",") != strings.Join(want, ",") {
+		t.Errorf("re-run calls = %q, want %q", gh.reruns, want)
+	}
+}
+
+func TestE2ERerunRefusedByGitHub(t *testing.T) {
+	gh := newMockGitHub(t)
+	gh.checks = rerunChecks()
+	gh.failRerun = true
+	term := startApp(t, gh, []string{"7", "--repo", "octo/demo"})
+	term.expect("✗ 1 failing")
+	term.send("w")
+	term.expect("✗ CI / test")
+	term.send("r")
+	term.expect("Re-run CI / test? (y/n)")
+	term.send("y")
+	term.expect("Must have admin rights to Repository.")
 }
 
 // waitFor polls cond until it holds or the test times out.

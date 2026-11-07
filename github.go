@@ -2,16 +2,19 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/cli/go-gh/v2/pkg/api"
 )
 
-// Client wraps the authenticated GraphQL client that go-gh builds from
-// whatever credentials `gh auth` already stored, so the extension never
-// deals with tokens itself.
+// Client wraps the authenticated GraphQL and REST clients that go-gh builds
+// from whatever credentials `gh auth` already stored, so the extension never
+// deals with tokens itself. REST is only needed for re-running Actions jobs,
+// which GraphQL can't do.
 type Client struct {
-	gql *api.GraphQLClient
+	gql  *api.GraphQLClient
+	rest *api.RESTClient
 }
 
 func NewClient() (*Client, error) {
@@ -19,7 +22,11 @@ func NewClient() (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating GraphQL client: %w", err)
 	}
-	return &Client{gql: gql}, nil
+	rest, err := api.DefaultRESTClient()
+	if err != nil {
+		return nil, fmt.Errorf("creating REST client: %w", err)
+	}
+	return &Client{gql: gql, rest: rest}, nil
 }
 
 type Author struct {
@@ -234,6 +241,11 @@ type Check struct {
 	URL         string
 	StartedAt   string
 	CompletedAt string
+
+	// Set only for GitHub Actions jobs; they are what Rerun needs.
+	JobID     int64
+	RunID     int64
+	RunNumber int
 }
 
 // CheckState buckets the many check conclusions the way `gh pr checks` does.
@@ -268,13 +280,14 @@ query PRChecks($owner: String!, $repo: String!, $number: Int!, $cursor: String) 
                 nodes {
                   __typename
                   ... on CheckRun {
+                    databaseId
                     name
                     status
                     conclusion
                     detailsUrl
                     startedAt
                     completedAt
-                    checkSuite { workflowRun { event workflow { name } } }
+                    checkSuite { workflowRun { databaseId runNumber event workflow { name } } }
                   }
                   ... on StatusContext {
                     context
@@ -298,6 +311,7 @@ type checkContext struct {
 	Typename string `json:"__typename"`
 
 	// CheckRun
+	DatabaseID  int64  `json:"databaseId"`
 	Name        string `json:"name"`
 	Status      string `json:"status"`
 	Conclusion  string `json:"conclusion"`
@@ -306,8 +320,10 @@ type checkContext struct {
 	CompletedAt string `json:"completedAt"`
 	CheckSuite  struct {
 		WorkflowRun *struct {
-			Event    string `json:"event"`
-			Workflow struct {
+			DatabaseID int64  `json:"databaseId"`
+			RunNumber  int    `json:"runNumber"`
+			Event      string `json:"event"`
+			Workflow   struct {
 				Name string `json:"name"`
 			} `json:"workflow"`
 		} `json:"workflowRun"`
@@ -414,6 +430,9 @@ func (ctx checkContext) toCheck() Check {
 	if run := ctx.CheckSuite.WorkflowRun; run != nil {
 		c.Workflow = run.Workflow.Name
 		c.Event = run.Event
+		c.JobID = ctx.DatabaseID
+		c.RunID = run.DatabaseID
+		c.RunNumber = run.RunNumber
 	}
 	if ctx.Status != "COMPLETED" {
 		c.State = CheckPending
@@ -430,4 +449,34 @@ func (ctx checkContext) toCheck() Check {
 	}
 	c.Detail = strings.ToLower(strings.ReplaceAll(ctx.Conclusion, "_", " "))
 	return c
+}
+
+// RerunScope is what to re-run, matching the buttons on a workflow run's page.
+type RerunScope int
+
+const (
+	RerunJob    RerunScope = iota // just the selected job
+	RerunFailed                   // the failed jobs of its run
+	RerunAll                      // every job of its run
+)
+
+// Rerun asks GitHub Actions to re-run the check's job or workflow run.
+func (c *Client) Rerun(owner, repo string, check Check, scope RerunScope) error {
+	var path string
+	switch scope {
+	case RerunJob:
+		path = fmt.Sprintf("repos/%s/%s/actions/jobs/%d/rerun", owner, repo, check.JobID)
+	case RerunFailed:
+		path = fmt.Sprintf("repos/%s/%s/actions/runs/%d/rerun-failed-jobs", owner, repo, check.RunID)
+	default:
+		path = fmt.Sprintf("repos/%s/%s/actions/runs/%d/rerun", owner, repo, check.RunID)
+	}
+	// Request rather than Post: these endpoints answer 201 with no useful
+	// body, which Post would try to decode as JSON.
+	resp, err := c.rest.Request(http.MethodPost, path, nil)
+	if err != nil {
+		return fmt.Errorf("re-running: %w", err)
+	}
+	resp.Body.Close()
+	return nil
 }
