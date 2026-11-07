@@ -95,6 +95,7 @@ func newModel(client *Client, owner, repo string, number int) model {
 	ta.Placeholder = "Write a reply..."
 	ta.ShowLineNumbers = false
 	ta.CharLimit = 0
+	ta.MaxHeight = 0 // quoted diffs can be long; never drop lines
 
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
@@ -254,7 +255,7 @@ func (m model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.renderDetail()
 		return m, nil
 
-	case "r":
+	case "r", "Q":
 		t, ok := m.selected()
 		if !ok {
 			return m, nil
@@ -263,6 +264,9 @@ func (m model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.status = ""
 		m.reply.Reset()
 		m.reply.Placeholder = "Reply to @" + firstAuthor(t) + "..."
+		if msg.String() == "Q" {
+			m.insertQuote(t)
+		}
 		m.layout()
 		return m, m.reply.Focus()
 
@@ -299,6 +303,12 @@ func (m model) updateReply(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = modeBrowse
 		m.reply.Blur()
 		m.layout()
+		return m, nil
+
+	case "ctrl+q":
+		if t, ok := m.selected(); ok {
+			m.insertQuote(t)
+		}
 		return m, nil
 
 	case "ctrl+s", "alt+enter":
@@ -460,27 +470,9 @@ const diffContext = 3
 // renderDiff colours the thread's diff hunk. Unless full is set, it keeps only
 // the tail of the hunk: the commented lines plus a little context above them.
 func renderDiff(t Thread, width int, full bool) string {
-	hunk := strings.TrimRight(t.DiffHunk(), "\n")
-	if hunk == "" {
+	header, lines, trimmed := diffLines(t, full)
+	if len(lines) == 0 && header == "" {
 		return ""
-	}
-	lines := strings.Split(hunk, "\n")
-
-	var header string
-	if strings.HasPrefix(lines[0], "@@") {
-		header, lines = lines[0], lines[1:]
-	}
-
-	trimmed := false
-	if !full {
-		keep := diffContext + 1
-		if t.StartLine != nil && t.Line != nil && *t.Line > *t.StartLine {
-			keep += *t.Line - *t.StartLine
-		}
-		if len(lines) > keep {
-			lines = lines[len(lines)-keep:]
-			trimmed = true
-		}
 	}
 
 	var out []string
@@ -501,6 +493,61 @@ func renderDiff(t Thread, width int, full bool) string {
 		out = append(out, l)
 	}
 	return strings.Join(out, "\n")
+}
+
+// diffLines splits the thread's hunk into its "@@" header and code lines,
+// keeping only the tail around the commented range unless full is set.
+func diffLines(t Thread, full bool) (header string, lines []string, trimmed bool) {
+	hunk := strings.TrimRight(t.DiffHunk(), "\n")
+	if hunk == "" {
+		return "", nil, false
+	}
+	lines = strings.Split(hunk, "\n")
+	if strings.HasPrefix(lines[0], "@@") {
+		header, lines = lines[0], lines[1:]
+	}
+	if !full {
+		keep := diffContext + 1
+		if t.StartLine != nil && t.Line != nil && *t.Line > *t.StartLine {
+			keep += *t.Line - *t.StartLine
+		}
+		if len(lines) > keep {
+			lines = lines[len(lines)-keep:]
+			trimmed = true
+		}
+	}
+	return header, lines, trimmed
+}
+
+// quoteDiff renders the same lines the diff view shows as a fenced ```diff
+// block, which github.com highlights. The fence grows if the code itself
+// contains backticks.
+func quoteDiff(t Thread, full bool) string {
+	_, lines, _ := diffLines(t, full)
+	if len(lines) == 0 {
+		return ""
+	}
+	code := strings.Join(lines, "\n")
+	fence := "```"
+	for strings.Contains(code, fence) {
+		fence += "`"
+	}
+	return fence + "diff\n" + code + "\n" + fence + "\n"
+}
+
+// insertQuote puts the selected thread's diff into the reply at the cursor,
+// starting on a fresh line and leaving the cursor below it ready to type.
+func (m *model) insertQuote(t Thread) {
+	quote := quoteDiff(t, m.fullDiff)
+	if quote == "" {
+		m.status = warnStyle.Render("! no diff to quote")
+		return
+	}
+	if m.reply.Value() != "" && !strings.HasSuffix(m.reply.Value(), "\n") {
+		quote = "\n" + quote
+	}
+	m.reply.InsertString(quote + "\n")
+	m.status = ""
 }
 
 func statusBadge(t Thread) string {
@@ -656,9 +703,9 @@ func (m model) viewFooter() string {
 	}
 	var keys string
 	if m.mode == modeReply {
-		keys = "ctrl+s send · esc cancel"
+		keys = "ctrl+s send · ctrl+q quote diff · esc cancel"
 	} else {
-		keys = "j/k move · J/K scroll · d diff · r reply · t resolve · a show resolved · o open · R refresh · q quit"
+		keys = "j/k move · J/K scroll · d diff · r reply · Q quote+reply · t resolve · a show resolved · o open · R refresh · q quit"
 	}
 	return dimStyle.Render(truncate(keys, m.width))
 }

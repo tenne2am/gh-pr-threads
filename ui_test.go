@@ -249,3 +249,56 @@ func TestNoDiffWithoutHunk(t *testing.T) {
 		t.Errorf("renderDiff = %q, want empty", got)
 	}
 }
+
+func TestQuoteOpensReplyWithCompactDiff(t *testing.T) {
+	m := key(withHunk(t), "Q")
+	if m.mode != modeReply {
+		t.Fatal("Q should enter reply mode")
+	}
+	want := "```diff\n- old()\n+ if x == nil {\n+ return nil\n+ }\n```\n\n"
+	// The textarea turns tabs into spaces; compare with whitespace collapsed.
+	got := strings.Join(strings.Fields(m.reply.Value()), " ")
+	if got != strings.Join(strings.Fields(want), " ") {
+		t.Errorf("reply = %q, want %q", m.reply.Value(), want)
+	}
+	if strings.Contains(m.reply.Value(), "@@") || strings.Contains(m.reply.Value(), "a := 1") {
+		t.Error("quote should match the compact view: no hunk header or far context")
+	}
+}
+
+func TestQuoteFollowsFullDiffToggle(t *testing.T) {
+	m := key(key(withHunk(t), "d"), "Q")
+	if !strings.Contains(m.reply.Value(), "a := 1") {
+		t.Errorf("with the full diff shown, the quote should be full too:\n%s", m.reply.Value())
+	}
+}
+
+func TestCtrlQInsertsQuoteAfterTypedText(t *testing.T) {
+	m := key(key(withHunk(t), "r"), "see")
+	n, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlQ})
+	m = n.(model)
+	if m.mode != modeReply {
+		t.Fatal("ctrl+q must not leave reply mode")
+	}
+	if v := m.reply.Value(); !strings.HasPrefix(v, "see\n```diff\n") {
+		t.Errorf("quote should start on its own line after the typed text, got %q", v)
+	}
+}
+
+func TestQuoteWithoutHunkWarns(t *testing.T) {
+	m := key(load(t), "Q")
+	if m.reply.Value() != "" {
+		t.Errorf("reply should stay empty, got %q", m.reply.Value())
+	}
+	if !strings.Contains(m.View(), "no diff to quote") {
+		t.Errorf("expected a warning in the footer, got:\n%s", m.View())
+	}
+}
+
+func TestQuoteFenceAvoidsBackticksInCode(t *testing.T) {
+	th := Thread{}
+	th.Comments.Nodes = []Comment{{DiffHunk: "@@ -1 +1 @@\n+s := \"```\""}}
+	if got := quoteDiff(th, true); !strings.HasPrefix(got, "````diff\n") || !strings.HasSuffix(got, "\n````\n") {
+		t.Errorf("fence should be longer than any backtick run in the code, got %q", got)
+	}
+}

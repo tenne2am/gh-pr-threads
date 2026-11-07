@@ -46,6 +46,7 @@ main.go:14-16  open
 
 @@ -10,6 +10,8 @@ func run() error {
 ⋮
+ 	c := 3
  	d := 4
 -	old()
 +	if x == nil {
@@ -65,6 +66,28 @@ this needs a nil check
 * Long lines are cut at the pane width rather than wrapped, so the code keeps its
   shape; use `o` to see the full line on github.com.
 
+### Quoting the diff in a reply
+
+Press `Q` to start a reply with the code already quoted, or `ctrl+q` while writing a
+reply to insert it at the cursor. The quote is exactly what the diff view is showing
+(compact or full, following `d`), without the `@@` header, as a fenced block that
+github.com renders with diff colours:
+
+````md
+```diff
+ 	c := 3
+ 	d := 4
+-	old()
++	if x == nil {
++		return nil
++	}
+```
+````
+
+The quote starts on its own line and leaves the cursor below it, so you can keep
+typing. If the code itself contains backticks, a longer fence is used. Tabs in the
+code become spaces, because the reply box can't hold tab characters.
+
 ## Keys
 
 **Browsing**
@@ -76,6 +99,7 @@ this needs a nil check
 | `J` / `K`, `ctrl+d` / `ctrl+u`, `pgdown` / `pgup` | scroll the conversation half a page |
 | `d` | show the full diff hunk / only the commented lines |
 | `r` | reply to the selected thread |
+| `Q` | reply with the diff quoted |
 | `t` | resolve / unresolve the selected thread |
 | `a` | show or hide resolved threads |
 | `o` | open the thread on github.com |
@@ -87,6 +111,7 @@ this needs a nil check
 | Key | Action |
 | --- | --- |
 | `ctrl+s`, `alt+enter` | send the reply |
+| `ctrl+q` | quote the diff at the cursor |
 | `esc` | cancel |
 
 ## Develop
