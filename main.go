@@ -18,11 +18,29 @@ func main() {
 	flag.StringVar(&repoFlag, "repo", "", "select a repository as OWNER/REPO")
 	flag.StringVar(&repoFlag, "R", "", "select a repository as OWNER/REPO (shorthand)")
 	flag.Usage = usage
-	flag.Parse()
 
-	if err := run(repoFlag, flag.Args()); err != nil {
+	if err := run(repoFlag, parseArgs(flag.CommandLine, os.Args[1:])); err != nil {
 		fmt.Fprintf(os.Stderr, "gh pr-threads: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+// parseArgs parses flags wherever they appear, so `gh pr-threads 123 --repo
+// o/r` works like gh's own commands; the flag package alone stops at the first
+// positional argument. Everything after "--" is positional.
+func parseArgs(fs *flag.FlagSet, args []string) []string {
+	var positional []string
+	for {
+		fs.Parse(args)
+		rest := fs.Args()
+		if len(rest) == 0 {
+			return positional
+		}
+		if consumed := len(args) - len(rest); consumed > 0 && args[consumed-1] == "--" {
+			return append(positional, rest...)
+		}
+		positional = append(positional, rest[0])
+		args = rest[1:]
 	}
 }
 
