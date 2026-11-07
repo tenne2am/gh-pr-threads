@@ -118,7 +118,7 @@ apps' check runs, and commit statuses from external CI.
 ✓ CI / lint                                    success · 42s
 ✓ ci/jenkins                                    Build passed
 - PR Triaging / label                                skipped
-checks on abc1234 · j/k move · o open run · r re-run job · f re-run failed · A re-run all · R refresh · esc back
+checks on abc1234 · j/k move · l logs · o open run · r re-run job · f re-run failed · A re-run all · R refresh · esc back
 ```
 
 * Failing checks come first, then pending, passed and skipped, each sorted by name.
@@ -129,6 +129,32 @@ checks on abc1234 · j/k move · o open run · r re-run job · f re-run failed �
 * The checks are fetched separately from the threads, so if they can't be read (for
   example a token without access to the repository's Actions), the error shows in the
   checks view and the threads keep working.
+
+### Job logs
+
+Press `l` on a GitHub Actions job to read its log without leaving the terminal:
+
+```
+✗ CI / test  failure · log
+▸ Run go test ./...
+--- FAIL: TestThing (0.01s)
+thing_test.go:12: got 1, want 2
+✗ Process completed with exit code 1.
+ 87% · j/k scroll · e/E next/prev error · t timestamps · o open · R reload · esc back
+```
+
+* A failed job's log opens at its first error (with a few lines above it); a failed job
+  without error annotations opens at the end, and other jobs at the top.
+* `e` / `E` jump to the next / previous `##[error]` line.
+* Step groups (`##[group]`) show as `▸` headings; errors, warnings and notices are
+  coloured. Long lines wrap, and re-wrap when the terminal is resized.
+* `t` shows or hides each line's timestamp (hidden by default).
+* Logs are only available once a job has finished; for a running job, or a check that
+  isn't an Actions job, `l` says so instead.
+* Logs are untrusted text — anything a workflow prints, including code from the pull
+  request. Every terminal escape sequence and control character is removed before
+  display, so a log can't change your terminal's title, write to your clipboard, clear
+  the screen or move the cursor.
 
 ### Re-running workflows
 
@@ -191,11 +217,25 @@ run's page:
 | `j` / `k`, `↓` / `↑` | move between checks |
 | `g` / `G`, `home` / `end` | first / last check |
 | `o`, `enter` | open the run on github.com |
+| `l` | show the job's log |
 | `r` | re-run the selected job |
 | `f` | re-run the failed jobs of its workflow run |
 | `A` | re-run all jobs of its workflow run |
 | `R`, `ctrl+r` | refresh the checks |
 | `esc`, `w`, `q` | back to the threads |
+
+**Job log** (after `l`)
+
+| Key | Action |
+| --- | --- |
+| `j` / `k`, `↓` / `↑` | scroll a line |
+| `J` / `K`, `ctrl+d` / `ctrl+u`, `space` | scroll half a page |
+| `g` / `G`, `home` / `end` | top / bottom |
+| `e` / `E` | next / previous error |
+| `t` | show / hide timestamps |
+| `o` | open the job on github.com |
+| `R`, `ctrl+r` | download the log again |
+| `esc`, `l`, `q` | back to the checks |
 
 **Replying**
 
@@ -225,8 +265,10 @@ no reinstall needed. `gh extension remove pr-threads` when you're done.
 | [`main.go`](main.go) | flag parsing, repository / PR number resolution |
 | [`github.go`](github.go) | GraphQL queries and mutations |
 | [`ui.go`](ui.go) | the Bubble Tea model, key handling, and rendering |
+| [`logs.go`](logs.go) | job log parsing, sanitising, wrapping, and the log view |
 | [`ui_test.go`](ui_test.go) | model tests driven by synthetic messages (no network) |
-| [`github_test.go`](github_test.go) | GraphQL client tests against a fake HTTP transport |
+| [`github_test.go`](github_test.go) | GraphQL and REST client tests against a fake HTTP transport |
+| [`logs_test.go`](logs_test.go) | log parsing, escape-sequence stripping, wrapping, and rendering |
 | [`e2e_test.go`](e2e_test.go) | end-to-end tests: the real binary in a pseudo-terminal against a mock GitHub |
 
 The end-to-end tests build the binary, run it in a pseudo-terminal, send keystrokes,
@@ -235,8 +277,10 @@ go-gh talks to the development host `github.localhost` over plain HTTP, so
 `GH_HOST=github.localhost` plus `HTTP_PROXY` pointing at the mock routes every request
 there, with no test hooks in the extension. The mock keeps state (replies and
 resolutions show up on reload, checks can be changed between refreshes, and the
-re-run REST endpoints queue the jobs they restart) and, like
-GitHub, only returns `diffHunk` when the query asks for it. A stand-in `gh` (via
+re-run REST endpoints queue the jobs they restart). Job logs are served through a
+redirect to a separate storage host that fails the test if it ever receives the token,
+and include escape-sequence attacks that must not reach the terminal. Like
+GitHub, the mock only returns `diffHunk` when the query asks for it. A stand-in `gh` (via
 `GH_PATH`) covers finding the current branch's PR, and a stand-in browser (via
 `GH_BROWSER`) records the URLs `o` opens.
 They need a Unix-like OS for the pseudo-terminal.
@@ -260,6 +304,9 @@ They need a Unix-like OS for the pseudo-terminal.
   `actions/runs/{id}/rerun-failed-jobs` and `actions/runs/{id}/rerun`; GraphQL has no
   equivalent. The job and run IDs come from `CheckRun.databaseId` and
   `workflowRun.databaseId` rather than being parsed out of URLs.
+* Job logs come from `actions/jobs/{id}/logs`, which redirects to short-lived blob
+  storage on another domain. go-gh only attaches the token to GitHub's own hosts, so
+  it isn't sent along with the redirect.
 * Replies use the `addPullRequestReviewThreadReply` mutation; resolving uses
   `resolveReviewThread` / `unresolveReviewThread`.
 * The TUI is [Bubble Tea](https://github.com/charmbracelet/bubbletea) — the same stack

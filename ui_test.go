@@ -801,7 +801,7 @@ func TestChecksViewScrolls(t *testing.T) {
 // (run 43) is still going, and ci/jenkins is not an Actions check.
 func rerunFixture() []Check {
 	return []Check{
-		{Workflow: "CI", Name: "test", State: CheckFail, JobID: 2, RunID: 42, RunNumber: 7},
+		{Workflow: "CI", Name: "test", State: CheckFail, JobID: 2, RunID: 42, RunNumber: 7, Detail: "failure"},
 		{Workflow: "Deploy", Name: "ship", State: CheckPending, JobID: 5, RunID: 43, RunNumber: 3},
 		{Workflow: "CI", Name: "lint", State: CheckPass, JobID: 1, RunID: 42, RunNumber: 7},
 		{Workflow: "Deploy", Name: "build", State: CheckPass, JobID: 4, RunID: 43, RunNumber: 3},
@@ -937,5 +937,195 @@ func TestRerunFailureShown(t *testing.T) {
 	}
 	if v := n.(model).View(); !strings.Contains(v, "Must have admin rights to Repository.") {
 		t.Errorf("expected GitHub's error in the footer, got:\n%s", v)
+	}
+}
+
+// failingLog has 40 lines of setup, two errors, and lines after them.
+func failingLog() string {
+	var b strings.Builder
+	b.WriteString("2026-09-01T10:00:00Z ##[group]Set up job\n")
+	for i := range 40 {
+		fmt.Fprintf(&b, "2026-09-01T10:00:%02dZ setup line %d\n", i%60, i)
+	}
+	b.WriteString("2026-09-01T10:01:00Z ##[endgroup]\n")
+	b.WriteString("2026-09-01T10:01:01Z --- FAIL: TestThing\n")
+	b.WriteString("2026-09-01T10:01:02Z ##[error]first error\n")
+	for i := range 20 {
+		fmt.Fprintf(&b, "2026-09-01T10:01:03Z between %d\n", i)
+	}
+	b.WriteString("2026-09-01T10:01:30Z ##[error]Process completed with exit code 1.\n")
+	for i := range 20 {
+		fmt.Fprintf(&b, "2026-09-01T10:01:31Z cleanup %d\n", i)
+	}
+	return b.String()
+}
+
+// logsOf opens the log view on the check with label and delivers text.
+func logsOf(t *testing.T, label, text string) model {
+	t.Helper()
+	m := checksAt(t, withChecks(t, rerunFixture()), label)
+	n, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	m = n.(model)
+	if m.mode != modeLogs || cmd == nil {
+		t.Fatalf("l should open the log view and fetch the log (mode %d)", m.mode)
+	}
+	n, _ = m.Update(logsMsg{jobID: m.logCheck.JobID, text: text})
+	return n.(model)
+}
+
+func TestLogsOpenOnFirstErrorOfFailedJob(t *testing.T) {
+	m := logsOf(t, "CI / test", failingLog())
+	v := plain(m.View())
+	for _, want := range []string{"✗ CI / test", "failure · log", "--- FAIL: TestThing", "✗ first error"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("log view missing %q\n---\n%s", want, v)
+		}
+	}
+	if strings.Contains(v, "setup line 0") {
+		t.Error("a failed job's log should open at its first error, not the top")
+	}
+	if got := m.logView.YOffset; got != m.logErrorRows[0]-logContext {
+		t.Errorf("YOffset = %d, want %d (first error with context above)", got, m.logErrorRows[0]-logContext)
+	}
+}
+
+func TestLogsJumpBetweenErrors(t *testing.T) {
+	m := logsOf(t, "CI / test", failingLog())
+	// The second error is near the end, so the view stops at the bottom
+	// rather than showing three lines of context above it.
+	bottom := m.logView.TotalLineCount() - m.logView.Height
+	first, second := m.logErrorRows[0]-logContext, min(m.logErrorRows[1]-logContext, bottom)
+
+	if m = key(m, "e"); m.logView.YOffset != second {
+		t.Errorf("e: YOffset = %d, want %d", m.logView.YOffset, second)
+	}
+	if m = key(m, "e"); !strings.Contains(m.View(), "no more errors") || m.logView.YOffset != second {
+		t.Error("e past the last error should stay put and say so")
+	}
+	if m = key(m, "E"); m.logView.YOffset != first {
+		t.Errorf("E: YOffset = %d, want %d", m.logView.YOffset, first)
+	}
+	// Scrolling to the top and pressing e finds the first error again.
+	if m = key(key(m, "g"), "e"); m.logView.YOffset != first {
+		t.Errorf("g then e: YOffset = %d, want %d", m.logView.YOffset, first)
+	}
+}
+
+func TestLogsOpenPositions(t *testing.T) {
+	ok := logsOf(t, "CI / lint", failingLog())
+	if ok.logView.YOffset != 0 {
+		t.Errorf("a passing job's log should open at the top, YOffset = %d", ok.logView.YOffset)
+	}
+
+	noMarkers := strings.ReplaceAll(failingLog(), "##[error]", "")
+	m := logsOf(t, "CI / test", noMarkers)
+	if !m.logView.AtBottom() {
+		t.Error("a failed job without error markers should open at the end, where failures usually are")
+	}
+	if m = key(m, "e"); !strings.Contains(m.View(), "no errors in this log") {
+		t.Errorf("e without errors should say so, got:\n%s", m.View())
+	}
+}
+
+func TestLogsTimestampsToggle(t *testing.T) {
+	m := logsOf(t, "CI / test", failingLog())
+	if strings.Contains(plain(m.View()), "10:01:02 ") {
+		t.Error("timestamps should be hidden by default")
+	}
+	m = key(m, "t")
+	if !strings.Contains(plain(m.View()), "10:01:02 ✗ first error") {
+		t.Errorf("t should show timestamps\n---\n%s", plain(m.View()))
+	}
+	if m = key(m, "t"); m.logShowTime {
+		t.Error("t should toggle timestamps off again")
+	}
+}
+
+func TestLogsGuards(t *testing.T) {
+	cases := []struct{ label, warning string }{
+		{"Deploy / ship", "Deploy / ship is still running; its log is available once it finishes"},
+		{"ci/jenkins", "ci/jenkins is not a GitHub Actions job; open it with o"},
+	}
+	for _, c := range cases {
+		n, cmd := checksAt(t, withChecks(t, rerunFixture()), c.label).Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+		m := n.(model)
+		if cmd != nil || m.mode != modeChecks {
+			t.Errorf("%s: should not open a log", c.label)
+		}
+		if !strings.Contains(m.View(), c.warning) {
+			t.Errorf("%s: want %q\n---\n%s", c.label, c.warning, m.View())
+		}
+	}
+}
+
+func TestLogsStates(t *testing.T) {
+	m := checksAt(t, withChecks(t, rerunFixture()), "CI / test")
+	n, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	m = n.(model)
+	v := m.View()
+	if !strings.Contains(v, "loading log...") || strings.Contains(v, "%") {
+		t.Errorf("while loading: want a loading message and no scroll position\n---\n%s", v)
+	}
+
+	// A log for a job the user already left is dropped.
+	n, _ = m.Update(logsMsg{jobID: 999, text: "stale"})
+	if n.(model).logLoaded {
+		t.Error("a log for another job must not be shown")
+	}
+
+	n, _ = m.Update(logsMsg{jobID: m.logCheck.JobID, err: errors.New("fetching logs: HTTP 410: Logs have expired")})
+	if v := n.(model).View(); !strings.Contains(v, "Logs have expired") {
+		t.Errorf("want the error, got:\n%s", v)
+	}
+	n, _ = m.Update(logsMsg{jobID: m.logCheck.JobID, text: "\ufeff"})
+	if v := n.(model).View(); !strings.Contains(v, "The log is empty.") {
+		t.Errorf("want an empty-log notice, got:\n%s", v)
+	}
+}
+
+func TestLogsKeys(t *testing.T) {
+	m := logsOf(t, "CI / lint", failingLog())
+	if m = key(m, "j"); m.logView.YOffset != 1 {
+		t.Errorf("j: YOffset = %d, want 1", m.logView.YOffset)
+	}
+	if m = key(m, "G"); !m.logView.AtBottom() {
+		t.Error("G should go to the end")
+	}
+	if !strings.Contains(m.View(), "100% ·") {
+		t.Errorf("footer should show the scroll position\n---\n%s", m.View())
+	}
+	for _, k := range []string{"esc", "q", "l"} {
+		var n tea.Model
+		if k == "esc" {
+			n, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		} else {
+			n, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)})
+		}
+		if n.(model).mode != modeChecks {
+			t.Errorf("%s should go back to the checks", k)
+		}
+	}
+	n, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("R")})
+	if cmd == nil || n.(model).logLoaded {
+		t.Error("R should download the log again")
+	}
+	_, cmd = m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	if cmd == nil {
+		t.Fatal("ctrl+c should quit")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Error("ctrl+c should return tea.Quit")
+	}
+}
+
+func TestLogsRewrapOnResize(t *testing.T) {
+	long := "2026-09-01T10:00:00Z " + strings.Repeat("y", 150) + "\n"
+	m := logsOf(t, "CI / lint", long)
+	if m.logView.TotalLineCount() != 2 {
+		t.Fatalf("150 cells at width 120 should wrap onto 2 rows, got %d", m.logView.TotalLineCount())
+	}
+	n, _ := m.Update(tea.WindowSizeMsg{Width: 60, Height: 40})
+	if got := n.(model).logView.TotalLineCount(); got != 3 {
+		t.Errorf("after narrowing to 60 cells: %d rows, want 3", got)
 	}
 }

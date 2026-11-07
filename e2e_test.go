@@ -62,7 +62,8 @@ type mockGitHub struct {
 	failReply  bool
 	failChecks bool
 	failRerun  bool
-	reruns     []string // "POST /repos/..." re-run calls received
+	reruns     []string         // "POST /repos/..." re-run calls received
+	logs       map[int64]string // job ID → log served via the storage redirect
 	nextID     int
 
 	headSHA string
@@ -137,9 +138,29 @@ func newMockGitHub(t *testing.T) *mockGitHub {
 	}
 }
 
-var rerunPath = regexp.MustCompile(`^/repos/octo/demo/actions/(jobs|runs)/(\d+)/(rerun|rerun-failed-jobs)$`)
+var (
+	rerunPath   = regexp.MustCompile(`^/repos/octo/demo/actions/(jobs|runs)/(\d+)/(rerun|rerun-failed-jobs)$`)
+	jobLogsPath = regexp.MustCompile(`^/repos/octo/demo/actions/jobs/(\d+)/logs$`)
+	storagePath = regexp.MustCompile(`^/logs/(\d+)\.txt$`)
+)
+
+// logStorageHost stands in for the blob storage GitHub redirects log
+// downloads to (productionresultssa*.blob.core.windows.net on github.com):
+// another domain, which must never see the GitHub token. go-gh sends the token
+// to every subdomain of the GitHub host, so this can't be one.
+const logStorageHost = "logs.blob.test"
 
 func (g *mockGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Host == logStorageHost {
+		g.serveLogStorage(w, r)
+		return
+	}
+	if r.Host == "api.github.localhost" && r.Method == http.MethodGet && jobLogsPath.MatchString(r.URL.Path) {
+		// Like GitHub: redirect to a short-lived storage URL.
+		id := jobLogsPath.FindStringSubmatch(r.URL.Path)[1]
+		http.Redirect(w, r, "http://"+logStorageHost+"/logs/"+id+".txt?sig=mock", http.StatusFound)
+		return
+	}
 	if r.Host == "api.github.localhost" && r.Method == http.MethodPost && rerunPath.MatchString(r.URL.Path) {
 		g.serveRerun(w, r)
 		return
@@ -225,6 +246,29 @@ func (g *mockGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]interface{}{"data": data})
+}
+
+func (g *mockGitHub) serveLogStorage(w http.ResponseWriter, r *http.Request) {
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		g.t.Errorf("the GitHub token was sent to the log storage host: %q", auth)
+	}
+	m := storagePath.FindStringSubmatch(r.URL.Path)
+	if m == nil || r.URL.Query().Get("sig") != "mock" {
+		g.t.Errorf("unexpected storage request %s", r.URL)
+		http.NotFound(w, r)
+		return
+	}
+	var id int64
+	fmt.Sscan(m[1], &id)
+	g.mu.Lock()
+	text, ok := g.logs[id]
+	g.mu.Unlock()
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte(text))
 }
 
 // serveRerun queues the jobs a re-run endpoint would restart, like GitHub.
@@ -726,6 +770,71 @@ func TestE2ERerunRefusedByGitHub(t *testing.T) {
 	term.expect("Re-run CI / test? (y/n)")
 	term.send("y")
 	term.expect("Must have admin rights to Repository.")
+}
+
+// testJobLog is CI / test's log: a setup group, a failing test with coloured
+// output, terminal escape attacks, and the runner's error annotation.
+func testJobLog() string {
+	var b strings.Builder
+	b.WriteString("\ufeff2026-09-01T10:00:00.1Z ##[group]Set up job\n")
+	for i := range 60 { // more than a screen, so the error is scrolled to
+		fmt.Fprintf(&b, "2026-09-01T10:00:%02d.1Z setup step %d\n", i, i)
+	}
+	b.WriteString("2026-09-01T10:00:59.1Z ##[endgroup]\n")
+	b.WriteString("2026-09-01T10:01:00.1Z ##[group]Run go test ./...\n")
+	b.WriteString("2026-09-01T10:01:01.1Z \x1b[31m--- FAIL: TestThing (0.01s)\x1b[0m\n")
+	b.WriteString("2026-09-01T10:01:01.2Z \x1b]0;pwned-title\x07\x1b]52;c;cHduZWQ=\x07\x1b[2Jthing_test.go:12: got 1, want 2\n")
+	b.WriteString("2026-09-01T10:01:02.1Z ##[error]Process completed with exit code 1.\n")
+	b.WriteString("2026-09-01T10:01:02.2Z ##[endgroup]\n")
+	return b.String()
+}
+
+func TestE2EJobLogs(t *testing.T) {
+	gh := newMockGitHub(t)
+	gh.checks = rerunChecks()
+	gh.logs = map[int64]string{2: testJobLog()}
+	term := startApp(t, gh, []string{"7", "--repo", "octo/demo"})
+	term.expect("✗ 1 failing")
+	term.send("w")
+	term.expect("✗ CI / test")
+
+	term.send("l")
+	term.expect("failure · log")
+	// A failed job opens at its error, past the setup group.
+	term.expect("▸ Run go test ./...")
+	term.expect("--- FAIL: TestThing (0.01s)")
+	term.expect("thing_test.go:12: got 1, want 2")
+	term.expect("✗ Process completed with exit code 1.")
+
+	// Nothing from the log may reach the terminal as a control sequence.
+	term.mu.Lock()
+	raw := term.out.String()
+	term.mu.Unlock()
+	for _, attack := range []string{"pwned-title", "\x1b]52;", "cHduZWQ="} {
+		if strings.Contains(raw, attack) {
+			t.Errorf("log content %q reached the terminal", attack)
+		}
+	}
+
+	term.send("t")
+	term.expect("10:01:02 ✗ Process completed with exit code 1.")
+
+	term.send("g")
+	term.expect("▸ Set up job")
+
+	term.send(keyEsc)
+	term.expect("l logs")
+}
+
+func TestE2EJobLogsUnavailable(t *testing.T) {
+	gh := newMockGitHub(t)
+	gh.checks = rerunChecks() // no logs stored: storage answers 404
+	term := startApp(t, gh, []string{"7", "--repo", "octo/demo"})
+	term.expect("✗ 1 failing")
+	term.send("w")
+	term.expect("✗ CI / test")
+	term.send("l")
+	term.expect("fetching logs: HTTP 404")
 }
 
 // waitFor polls cond until it holds or the test times out.

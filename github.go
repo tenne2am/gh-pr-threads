@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
@@ -479,4 +480,21 @@ func (c *Client) Rerun(owner, repo string, check Check, scope RerunScope) error 
 	}
 	resp.Body.Close()
 	return nil
+}
+
+// JobLogs downloads the plain-text log of a finished Actions job. GitHub
+// answers with a redirect to short-lived storage; go-gh only attaches the
+// token to GitHub's own hosts, so it is not sent along with the redirect.
+func (c *Client) JobLogs(owner, repo string, jobID int64) (string, error) {
+	path := fmt.Sprintf("repos/%s/%s/actions/jobs/%d/logs", owner, repo, jobID)
+	resp, err := c.rest.Request(http.MethodGet, path, nil)
+	if err != nil {
+		return "", fmt.Errorf("fetching logs: %w", err)
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("reading logs: %w", err)
+	}
+	return string(b), nil
 }

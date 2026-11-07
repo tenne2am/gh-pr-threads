@@ -22,6 +22,7 @@ const (
 	modeReply
 	modeDiff   // picking lines of the diff to quote
 	modeChecks // the CI checks on the PR's head commit
+	modeLogs   // the log of one Actions job
 )
 
 // --- messages ---------------------------------------------------------------
@@ -54,6 +55,12 @@ type rerunMsg struct {
 
 // refreshChecksMsg refetches the checks without blanking the view.
 type refreshChecksMsg struct{}
+
+type logsMsg struct {
+	jobID int64
+	text  string
+	err   error
+}
 
 type errMsg struct{ err error }
 
@@ -106,6 +113,13 @@ type model struct {
 	checkCursor  int
 	checkOffset  int
 	confirm      *rerunRequest // a re-run waiting for y/n
+
+	logCheck     Check // the job whose log is shown
+	logLines     []logLine
+	logLoaded    bool
+	logErr       error
+	logShowTime  bool
+	logErrorRows []int // rendered rows where errors start
 	status       string
 	err          error
 
@@ -113,6 +127,7 @@ type model struct {
 	height int
 
 	detail  viewport.Model
+	logView viewport.Model
 	reply   textarea.Model
 	spinner spinner.Model
 }
@@ -135,6 +150,7 @@ func newModel(client *Client, owner, repo string, number int) model {
 		number:  number,
 		loading: true,
 		detail:  viewport.New(0, 0),
+		logView: viewport.New(0, 0),
 		reply:   ta,
 		spinner: sp,
 	}
@@ -160,6 +176,13 @@ func (m model) checksCmd() tea.Cmd {
 	return func() tea.Msg {
 		sha, checks, err := m.client.Checks(m.owner, m.repo, m.number)
 		return checksMsg{sha: sha, checks: checks, err: err}
+	}
+}
+
+func (m model) logsCmd(c Check) tea.Cmd {
+	return func() tea.Msg {
+		text, err := m.client.JobLogs(m.owner, m.repo, c.JobID)
+		return logsMsg{jobID: c.JobID, text: text, err: err}
 	}
 }
 
@@ -253,6 +276,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case refreshChecksMsg:
 		return m, m.checksCmd()
 
+	case logsMsg:
+		if msg.jobID != m.logCheck.JobID {
+			return m, nil // the user moved on to another job's log
+		}
+		m.logLoaded = true
+		m.logErr = msg.err
+		m.logLines = parseLog(msg.text)
+		m.renderLogView()
+		m.logView.SetYOffset(m.initialLogOffset())
+		return m, nil
+
 	case checksMsg:
 		m.checksLoaded = true
 		m.checksErr = msg.err
@@ -275,6 +309,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateDiff(msg)
 		case modeChecks:
 			return m.updateChecks(msg)
+		case modeLogs:
+			return m.updateLogs(msg)
 		}
 		return m.updateBrowse(msg)
 	}
@@ -506,6 +542,10 @@ func (m model) updateChecks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.checksLoaded = false
 		m.status = ""
 		return m, m.checksCmd()
+	case "l":
+		if m.checkCursor < len(m.checks) {
+			return m, m.openLogs(m.checks[m.checkCursor])
+		}
 	case "r", "f", "A":
 		if m.checkCursor < len(m.checks) {
 			scope := map[string]RerunScope{"r": RerunJob, "f": RerunFailed, "A": RerunAll}[msg.String()]
@@ -673,8 +713,11 @@ func (m *model) layout() {
 	m.detail.Height = m.bodyHeight()
 	m.reply.SetWidth(max(20, m.width-2))
 	m.reply.SetHeight(replyBoxHeight - 3)
+	m.logView.Width = m.width
+	m.logView.Height = max(1, m.bodyHeight()-1) // one row for the job title
 	m.clampOffset()
 	m.renderDetail()
+	m.renderLogView()
 }
 
 // renderDetail rebuilds the conversation pane for the selected thread.
@@ -1056,6 +1099,8 @@ func (m model) View() string {
 
 	if m.mode == modeChecks {
 		b.WriteString(m.viewChecks())
+	} else if m.mode == modeLogs {
+		b.WriteString(m.viewLogs())
 	} else if m.loading {
 		b.WriteString(m.spinner.View() + dimStyle.Render(" loading review threads..."))
 		b.WriteString(strings.Repeat("\n", max(0, m.bodyHeight()-1)))
@@ -1169,9 +1214,14 @@ func (m model) viewFooter() string {
 	case modeDiff:
 		keys = "j/k extend selection · space restart here · d full hunk · enter quote+reply · esc back"
 	case modeChecks:
-		keys = "j/k move · o open run · r re-run job · f re-run failed · A re-run all · R refresh · esc back"
+		keys = "j/k move · l logs · o open run · r re-run job · f re-run failed · A re-run all · R refresh · esc back"
 		if m.checksSHA != "" {
 			keys = "checks on " + m.checksSHA[:min(7, len(m.checksSHA))] + " · " + keys
+		}
+	case modeLogs:
+		keys = "j/k scroll · e/E next/prev error · t timestamps · o open · R reload · esc back"
+		if m.logLoaded && m.logErr == nil && len(m.logLines) > 0 {
+			keys = fmt.Sprintf("%3.f%% · ", m.logView.ScrollPercent()*100) + keys
 		}
 	default:
 		keys = "j/k move · J/K scroll · d diff · v select lines · r reply · Q quote+reply · t resolve · a show resolved · w checks · o open · R refresh · q quit"

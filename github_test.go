@@ -324,3 +324,59 @@ func TestRerunError(t *testing.T) {
 		t.Errorf("err = %v, want GitHub's message wrapped", err)
 	}
 }
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func respond(r *http.Request, status int, header http.Header, body string) *http.Response {
+	if header == nil {
+		header = http.Header{}
+	}
+	return &http.Response{StatusCode: status, Header: header, Body: io.NopCloser(bytes.NewBufferString(body)), Request: r}
+}
+
+func TestJobLogsFollowsRedirectWithoutLeakingToken(t *testing.T) {
+	var seen []string
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		seen = append(seen, r.URL.Host+r.URL.Path+" auth="+r.Header.Get("Authorization"))
+		if r.URL.Host == "api.github.com" {
+			// GitHub hands out a short-lived link to the log in blob storage.
+			return respond(r, http.StatusFound, http.Header{"Location": {"https://results.blob.test/logs/9.txt?sig=abc"}}, ""), nil
+		}
+		return respond(r, http.StatusOK, http.Header{"Content-Type": {"text/plain"}}, "2026-09-01T10:00:00Z hello\n"), nil
+	})
+	rest, err := api.NewRESTClient(api.ClientOptions{Host: "github.com", AuthToken: "test-token", Transport: rt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{rest: rest}
+
+	text, err := client.JobLogs("o", "r", 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "2026-09-01T10:00:00Z hello\n" {
+		t.Errorf("text = %q", text)
+	}
+	want := []string{
+		"api.github.com/repos/o/r/actions/jobs/9/logs auth=token test-token",
+		"results.blob.test/logs/9.txt auth=",
+	}
+	if strings.Join(seen, "\n") != strings.Join(want, "\n") {
+		t.Errorf("requests:\n%s\nwant (token only sent to GitHub):\n%s", strings.Join(seen, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestJobLogsError(t *testing.T) {
+	client, fake := fakeClient(t)
+	fake.restStatus = http.StatusGone
+	fake.restBody = `{"message":"Logs have expired"}`
+	_, err := client.JobLogs("o", "r", 9)
+	if err == nil || !strings.Contains(err.Error(), "fetching logs") || !strings.Contains(err.Error(), "Logs have expired") {
+		t.Errorf("err = %v, want GitHub's message wrapped", err)
+	}
+	if fake.rest[0] != "GET /repos/o/r/actions/jobs/9/logs" {
+		t.Errorf("request = %q", fake.rest[0])
+	}
+}
