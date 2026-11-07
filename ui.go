@@ -76,6 +76,7 @@ type model struct {
 	offset  int   // first visible row of the list pane
 
 	showResolved bool
+	fullDiff     bool // show the whole diff hunk instead of just the commented lines
 	mode         mode
 	loading      bool
 	status       string
@@ -240,6 +241,11 @@ func (m model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "ctrl+u", "pgup", "K":
 		m.detail.HalfPageUp()
+		return m, nil
+
+	case "d":
+		m.fullDiff = !m.fullDiff
+		m.renderDetail()
 		return m, nil
 
 	case "a":
@@ -423,6 +429,11 @@ func (m *model) renderDetail() {
 	b.WriteString(statusBadge(t))
 	b.WriteString("\n\n")
 
+	if diff := renderDiff(t, w, m.fullDiff); diff != "" {
+		b.WriteString(diff)
+		b.WriteString("\n\n")
+	}
+
 	for i, c := range t.Comments.Nodes {
 		if i > 0 {
 			b.WriteString("\n")
@@ -440,6 +451,56 @@ func (m *model) renderDetail() {
 
 	m.detail.SetContent(b.String())
 	m.detail.GotoTop()
+}
+
+// diffContext is how many lines above the commented range the compact diff
+// view keeps, matching what github.com shows next to a review comment.
+const diffContext = 3
+
+// renderDiff colours the thread's diff hunk. Unless full is set, it keeps only
+// the tail of the hunk: the commented lines plus a little context above them.
+func renderDiff(t Thread, width int, full bool) string {
+	hunk := strings.TrimRight(t.DiffHunk(), "\n")
+	if hunk == "" {
+		return ""
+	}
+	lines := strings.Split(hunk, "\n")
+
+	var header string
+	if strings.HasPrefix(lines[0], "@@") {
+		header, lines = lines[0], lines[1:]
+	}
+
+	trimmed := false
+	if !full {
+		keep := diffContext + 1
+		if t.StartLine != nil && t.Line != nil && *t.Line > *t.StartLine {
+			keep += *t.Line - *t.StartLine
+		}
+		if len(lines) > keep {
+			lines = lines[len(lines)-keep:]
+			trimmed = true
+		}
+	}
+
+	var out []string
+	if header != "" {
+		out = append(out, accentStyle.Render(truncate(header, width)))
+	}
+	if trimmed {
+		out = append(out, dimStyle.Render("⋮"))
+	}
+	for _, l := range lines {
+		l = truncate(strings.ReplaceAll(l, "\t", "    "), width)
+		switch {
+		case strings.HasPrefix(l, "+"):
+			l = okStyle.Render(l)
+		case strings.HasPrefix(l, "-"):
+			l = errStyle.Render(l)
+		}
+		out = append(out, l)
+	}
+	return strings.Join(out, "\n")
 }
 
 func statusBadge(t Thread) string {
@@ -597,7 +658,7 @@ func (m model) viewFooter() string {
 	if m.mode == modeReply {
 		keys = "ctrl+s send · esc cancel"
 	} else {
-		keys = "j/k move · J/K scroll · r reply · t resolve · a show resolved · o open · R refresh · q quit"
+		keys = "j/k move · J/K scroll · d diff · r reply · t resolve · a show resolved · o open · R refresh · q quit"
 	}
 	return dimStyle.Render(truncate(keys, m.width))
 }

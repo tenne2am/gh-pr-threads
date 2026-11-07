@@ -189,3 +189,63 @@ func TestLocationLabels(t *testing.T) {
 		}
 	}
 }
+
+const sampleHunk = `@@ -10,6 +10,8 @@ func run() error {
+ 	a := 1
+ 	b := 2
+ 	c := 3
+ 	d := 4
+-	old()
++	if x == nil {
++		return nil
++	}`
+
+func withHunk(t *testing.T) model {
+	t.Helper()
+	threads := fixture()
+	threads[0].Comments.Nodes[0].DiffHunk = sampleHunk
+	m := newModel(nil, "o", "r", 1)
+	n, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	n, _ = n.Update(loadedMsg{threads: threads})
+	return n.(model)
+}
+
+func TestDiffShownCompactByDefault(t *testing.T) {
+	v := withHunk(t).View()
+	for _, want := range []string{"@@ -10,6 +10,8 @@", "⋮", "+        return nil", "-    old()"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("view missing %q\n---\n%s", want, v)
+		}
+	}
+	if strings.Contains(v, "a := 1") {
+		t.Error("compact diff should drop lines far above the comment")
+	}
+}
+
+func TestDiffToggleShowsFullHunk(t *testing.T) {
+	m := key(withHunk(t), "d")
+	v := m.View()
+	if !strings.Contains(v, "a := 1") {
+		t.Errorf("full diff should include the top of the hunk\n---\n%s", v)
+	}
+	if strings.Contains(v, "⋮") {
+		t.Error("full diff should not show the elision marker")
+	}
+	if key(m, "d").fullDiff {
+		t.Error("d should toggle back to the compact diff")
+	}
+}
+
+func TestDiffKeepsWholeMultiLineRange(t *testing.T) {
+	th := Thread{Path: "a.go", Line: line(17), StartLine: line(10)}
+	th.Comments.Nodes = []Comment{{DiffHunk: sampleHunk}}
+	if got := renderDiff(th, 80, false); strings.Contains(got, "⋮") {
+		t.Errorf("an 8-line range should keep the whole hunk, got:\n%s", got)
+	}
+}
+
+func TestNoDiffWithoutHunk(t *testing.T) {
+	if got := renderDiff(fixture()[1], 80, false); got != "" {
+		t.Errorf("renderDiff = %q, want empty", got)
+	}
+}

@@ -5,7 +5,8 @@ pull request in a terminal UI and lets you reply to them, resolve them, and jump
 on github.com without leaving the terminal.
 
 The left pane lists the threads (`file.go:42` plus the first line of the opening
-comment); the right pane shows the whole conversation for the selected thread.
+comment); the right pane shows the code the thread was opened on (as a coloured diff) followed
+by the whole conversation for the selected thread.
 Resolved threads are hidden until you press `a`.
 
 ## Install
@@ -44,6 +45,7 @@ With no number, the PR is found with `gh pr view` for the current branch.
 | `j` / `k`, `↓` / `↑` | move between threads |
 | `g` / `G`, `home` / `end` | first / last thread |
 | `J` / `K`, `ctrl+d` / `ctrl+u`, `pgdown` / `pgup` | scroll the conversation half a page |
+| `d` | show the full diff hunk / only the commented lines |
 | `r` | reply to the selected thread |
 | `t` | resolve / unresolve the selected thread |
 | `a` | show or hide resolved threads |
@@ -87,6 +89,9 @@ no reinstall needed. `gh extension remove pr-threads` when you're done.
   through all of them. The REST endpoint (`/pulls/{n}/comments`) returns a *flat*
   comment list that you would have to re-group by `in_reply_to_id` yourself, and it
   can't tell you `isResolved`.
+* The code shown above each conversation is the opening comment's `diffHunk`. It ends at
+  the commented line, so by default only the commented range and 3 lines of context
+  above it are shown, like on github.com; `d` shows the whole hunk.
 * Replies use the `addPullRequestReviewThreadReply` mutation; resolving uses
   `resolveReviewThread` / `unresolveReviewThread`.
 * The TUI is [Bubble Tea](https://github.com/charmbracelet/bubbletea) — the same stack

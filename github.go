@@ -32,6 +32,9 @@ type Comment struct {
 	CreatedAt string `json:"createdAt"`
 	URL       string `json:"url"`
 	Author    Author `json:"author"`
+	// DiffHunk is the slice of the diff the comment was left on, ending at
+	// the commented line.
+	DiffHunk string `json:"diffHunk"`
 }
 
 type Thread struct {
@@ -73,6 +76,15 @@ func (t Thread) Preview() string {
 	return body
 }
 
+// DiffHunk is the code the thread was opened on. Replies carry the same hunk,
+// so the opening comment's is enough.
+func (t Thread) DiffHunk() string {
+	if len(t.Comments.Nodes) == 0 {
+		return ""
+	}
+	return t.Comments.Nodes[0].DiffHunk
+}
+
 func (t Thread) URL() string {
 	if len(t.Comments.Nodes) == 0 {
 		return ""
@@ -102,6 +114,7 @@ query PRReviewThreads($owner: String!, $repo: String!, $number: Int!, $cursor: S
               createdAt
               url
               author { login }
+              diffHunk
             }
           }
         }
