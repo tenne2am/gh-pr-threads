@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -19,7 +20,8 @@ type mode int
 const (
 	modeBrowse mode = iota
 	modeReply
-	modeDiff // picking lines of the diff to quote
+	modeDiff   // picking lines of the diff to quote
+	modeChecks // the CI checks on the PR's head commit
 )
 
 // --- messages ---------------------------------------------------------------
@@ -37,6 +39,12 @@ type repliedMsg struct {
 type resolvedMsg struct {
 	threadID string
 	resolved bool
+}
+
+type checksMsg struct {
+	sha    string
+	checks []Check
+	err    error
 }
 
 type errMsg struct{ err error }
@@ -82,6 +90,13 @@ type model struct {
 	selCursor    int  // modeDiff: the moving end of the selection
 	mode         mode
 	loading      bool
+
+	checks       []Check // sorted: failing first, then pending, passed, skipped
+	checksSHA    string
+	checksLoaded bool
+	checksErr    error
+	checkCursor  int
+	checkOffset  int
 	status       string
 	err          error
 
@@ -117,7 +132,7 @@ func newModel(client *Client, owner, repo string, number int) model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(m.loadCmd(), m.spinner.Tick)
+	return tea.Batch(m.loadCmd(), m.checksCmd(), m.spinner.Tick)
 }
 
 // --- commands ---------------------------------------------------------------
@@ -129,6 +144,13 @@ func (m model) loadCmd() tea.Cmd {
 			return errMsg{err}
 		}
 		return loadedMsg{title: title, threads: threads}
+	}
+}
+
+func (m model) checksCmd() tea.Cmd {
+	return func() tea.Msg {
+		sha, checks, err := m.client.Checks(m.owner, m.repo, m.number)
+		return checksMsg{sha: sha, checks: checks, err: err}
 	}
 }
 
@@ -201,6 +223,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.renderDetail()
 		return m, nil
 
+	case checksMsg:
+		m.checksLoaded = true
+		m.checksErr = msg.err
+		m.checksSHA = msg.sha
+		m.checks = sortChecks(msg.checks)
+		m.checkCursor = clamp(m.checkCursor, 0, max(0, len(m.checks)-1))
+		m.clampCheckOffset()
+		return m, nil
+
 	case errMsg:
 		m.loading = false
 		m.status = errStyle.Render("! " + msg.err.Error())
@@ -212,6 +243,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateReply(msg)
 		case modeDiff:
 			return m.updateDiff(msg)
+		case modeChecks:
+			return m.updateChecks(msg)
 		}
 		return m.updateBrowse(msg)
 	}
@@ -307,16 +340,16 @@ func (m model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "R", "ctrl+r":
 		m.loading = true
 		m.status = ""
-		return m, tea.Batch(m.loadCmd(), m.spinner.Tick)
+		return m, tea.Batch(m.loadCmd(), m.checksCmd(), m.spinner.Tick)
+
+	case "w":
+		m.mode = modeChecks
+		m.status = ""
+		return m, nil
 
 	case "o":
-		t, ok := m.selected()
-		if !ok || t.URL() == "" {
-			return m, nil
-		}
-		b := browser.New("", os.Stdout, os.Stderr)
-		if err := b.Browse(t.URL()); err != nil {
-			m.status = errStyle.Render("! " + err.Error())
+		if t, ok := m.selected(); ok {
+			m.openURL(t.URL())
 		}
 		return m, nil
 	}
@@ -407,6 +440,45 @@ func (m model) updateDiff(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	m.renderDetail()
 	return m, nil
+}
+
+// updateChecks handles keys on the checks view.
+func (m model) updateChecks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc", "w", "q":
+		m.mode = modeBrowse
+	case "j", "down":
+		m.checkCursor = clamp(m.checkCursor+1, 0, max(0, len(m.checks)-1))
+	case "k", "up":
+		m.checkCursor = clamp(m.checkCursor-1, 0, max(0, len(m.checks)-1))
+	case "g", "home":
+		m.checkCursor = 0
+	case "G", "end":
+		m.checkCursor = max(0, len(m.checks)-1)
+	case "o", "enter":
+		if m.checkCursor < len(m.checks) {
+			m.openURL(m.checks[m.checkCursor].URL)
+		}
+	case "R", "ctrl+r":
+		m.checksLoaded = false
+		m.status = ""
+		return m, m.checksCmd()
+	}
+	m.clampCheckOffset()
+	return m, nil
+}
+
+// openURL opens url in the browser, reporting failures in the footer.
+func (m *model) openURL(url string) {
+	if url == "" {
+		return
+	}
+	b := browser.New("", os.Stdout, os.Stderr)
+	if err := b.Browse(url); err != nil {
+		m.status = errStyle.Render("! " + err.Error())
+	}
 }
 
 // startReply opens the reply box for t, pre-filled with quote if non-empty.
@@ -745,6 +817,137 @@ func humanTime(ts string) string {
 	}
 }
 
+// --- checks -----------------------------------------------------------------
+
+// sortChecks orders checks the way `gh pr checks` does: what needs attention
+// first, then by workflow and job name.
+func sortChecks(checks []Check) []Check {
+	sorted := append([]Check(nil), checks...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		a, b := sorted[i], sorted[j]
+		if a.State != b.State {
+			return a.State < b.State
+		}
+		return a.Label() < b.Label()
+	})
+	return sorted
+}
+
+func (m *model) clampCheckOffset() {
+	h := m.bodyHeight()
+	if m.checkCursor < m.checkOffset {
+		m.checkOffset = m.checkCursor
+	}
+	if m.checkCursor >= m.checkOffset+h {
+		m.checkOffset = m.checkCursor - h + 1
+	}
+	m.checkOffset = max(0, m.checkOffset)
+}
+
+func checkIcon(s CheckState) string {
+	switch s {
+	case CheckPass:
+		return okStyle.Render("✓")
+	case CheckFail:
+		return errStyle.Render("✗")
+	case CheckPending:
+		return warnStyle.Render("●")
+	default:
+		return dimStyle.Render("-")
+	}
+}
+
+// checksSummary is the one-line CI state for the header, or "" when there is
+// nothing to report yet.
+func checksSummary(checks []Check) string {
+	var fail, pending, pass int
+	for _, c := range checks {
+		switch c.State {
+		case CheckFail:
+			fail++
+		case CheckPending:
+			pending++
+		case CheckPass:
+			pass++
+		}
+	}
+	switch {
+	case fail > 0:
+		return errStyle.Render(fmt.Sprintf("✗ %d failing", fail))
+	case pending > 0:
+		return warnStyle.Render(fmt.Sprintf("● %d pending", pending))
+	case pass > 0:
+		return okStyle.Render(fmt.Sprintf("✓ %d passed", pass))
+	case len(checks) > 0:
+		return dimStyle.Render(fmt.Sprintf("- %d skipped", len(checks)))
+	}
+	return ""
+}
+
+// checkTiming is how long a finished check took, or how long a running one has
+// been going.
+func checkTiming(c Check, now time.Time) string {
+	start, err := time.Parse(time.RFC3339, c.StartedAt)
+	if err != nil {
+		return ""
+	}
+	if c.State == CheckPending {
+		return "running " + formatDuration(now.Sub(start))
+	}
+	end, err := time.Parse(time.RFC3339, c.CompletedAt)
+	// Skipped jobs can report a start after their end.
+	if err != nil || end.Before(start) || c.State == CheckSkipped {
+		return ""
+	}
+	return formatDuration(end.Sub(start))
+}
+
+func formatDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
+	default:
+		return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+	}
+}
+
+func (m model) viewChecks() string {
+	w, h := max(20, m.width-1), m.bodyHeight()
+	box := lipgloss.NewStyle().Width(w).Height(h).MaxHeight(h)
+
+	switch {
+	case !m.checksLoaded:
+		return box.Render(dimStyle.Render("loading checks..."))
+	case m.checksErr != nil:
+		return box.Render(errStyle.Render("! " + m.checksErr.Error()))
+	case len(m.checks) == 0:
+		return box.Render(dimStyle.Render("No checks have run on the head commit."))
+	}
+
+	now := time.Now()
+	var rows []string
+	for i := m.checkOffset; i < len(m.checks) && i < m.checkOffset+h; i++ {
+		c := m.checks[i]
+		detail := c.Detail
+		if timing := checkTiming(c, now); timing != "" {
+			detail += " · " + timing
+		}
+		detail = dimStyle.Render(truncate(detail, w/3))
+
+		label := truncate(c.Label(), w-4-lipgloss.Width(detail))
+		if i == m.checkCursor {
+			label = selectedStyle.Render(label)
+		}
+		left := checkIcon(c.State) + " " + label
+		gap := max(1, w-lipgloss.Width(left)-lipgloss.Width(detail))
+		rows = append(rows, left+strings.Repeat(" ", gap)+detail)
+	}
+	return box.Render(strings.Join(rows, "\n"))
+}
+
 // --- view -------------------------------------------------------------------
 
 func (m model) View() string {
@@ -756,7 +959,9 @@ func (m model) View() string {
 	b.WriteString(m.viewHeader())
 	b.WriteString("\n\n")
 
-	if m.loading {
+	if m.mode == modeChecks {
+		b.WriteString(m.viewChecks())
+	} else if m.loading {
 		b.WriteString(m.spinner.View() + dimStyle.Render(" loading review threads..."))
 		b.WriteString(strings.Repeat("\n", max(0, m.bodyHeight()-1)))
 	} else {
@@ -791,6 +996,9 @@ func (m model) viewHeader() string {
 		}
 	}
 	right := dimStyle.Render(fmt.Sprintf("%d open / %d total", open, len(m.threads)))
+	if summary := checksSummary(m.checks); summary != "" {
+		right += dimStyle.Render(" · ") + summary
+	}
 
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 1 {
@@ -861,8 +1069,13 @@ func (m model) viewFooter() string {
 		keys = "ctrl+s send · ctrl+q quote diff · esc cancel"
 	case modeDiff:
 		keys = "j/k extend selection · space restart here · d full hunk · enter quote+reply · esc back"
+	case modeChecks:
+		keys = "j/k move · o open run · R refresh checks · esc back"
+		if m.checksSHA != "" {
+			keys = "checks on " + m.checksSHA[:min(7, len(m.checksSHA))] + " · " + keys
+		}
 	default:
-		keys = "j/k move · J/K scroll · d diff · v select lines · r reply · Q quote+reply · t resolve · a show resolved · o open · R refresh · q quit"
+		keys = "j/k move · J/K scroll · d diff · v select lines · r reply · Q quote+reply · t resolve · a show resolved · w checks · o open · R refresh · q quit"
 	}
 	return dimStyle.Render(truncate(keys, m.width))
 }

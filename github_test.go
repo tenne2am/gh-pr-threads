@@ -160,3 +160,97 @@ func TestQuotedReplyIsPostedVerbatim(t *testing.T) {
 		t.Errorf("expected a success message, got:\n%s", m.View())
 	}
 }
+
+// checksPage builds one page of the PRChecks response around raw context nodes.
+func checksPage(nodes string, next bool) string {
+	return fmt.Sprintf(`{"data":{"repository":{"pullRequest":{"commits":{"nodes":[{"commit":{
+	  "oid":"abc1234def",
+	  "statusCheckRollup":{"contexts":{
+	    "pageInfo":{"hasNextPage":%t,"endCursor":"p1"},
+	    "nodes":[%s]}}}}]}}}}}`, next, nodes)
+}
+
+func TestChecksNormalizesRunsAndStatuses(t *testing.T) {
+	nodes := `
+	  {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS",
+	   "detailsUrl":"https://example.test/run/1","startedAt":"2026-09-01T10:00:00Z","completedAt":"2026-09-01T10:01:30Z",
+	   "checkSuite":{"workflowRun":{"event":"pull_request","workflow":{"name":"CI"}}}},
+	  {"__typename":"CheckRun","name":"test","status":"IN_PROGRESS","conclusion":null,
+	   "checkSuite":{"workflowRun":{"event":"push","workflow":{"name":"CI"}}}},
+	  {"__typename":"CheckRun","name":"deploy","status":"COMPLETED","conclusion":"TIMED_OUT",
+	   "checkSuite":{"workflowRun":{"event":"pull_request","workflow":{"name":"CD"}}}},
+	  {"__typename":"CheckRun","name":"label","status":"COMPLETED","conclusion":"SKIPPED","checkSuite":{"workflowRun":null}},
+	  {"__typename":"StatusContext","context":"ci/jenkins","state":"ERROR","targetUrl":"https://jenkins.test/1",
+	   "description":"Build broke","createdAt":"2026-09-01T10:00:00Z"},
+	  {"__typename":"StatusContext","context":"ci/other","state":"EXPECTED"}`
+	client, fake := fakeClient(t, checksPage(nodes, false))
+	sha, checks, err := client.Checks("o", "r", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vars := fake.requests[0].Variables; vars["owner"] != "o" || vars["repo"] != "r" || vars["number"] != float64(7) {
+		t.Errorf("checks query for the wrong PR: %v", vars)
+	}
+	if sha != "abc1234def" {
+		t.Errorf("sha = %q", sha)
+	}
+	want := []Check{
+		{Name: "build", Workflow: "CI", Event: "pull_request", State: CheckPass, Detail: "success",
+			URL: "https://example.test/run/1", StartedAt: "2026-09-01T10:00:00Z", CompletedAt: "2026-09-01T10:01:30Z"},
+		{Name: "test", Workflow: "CI", Event: "push", State: CheckPending, Detail: "in progress"},
+		{Name: "deploy", Workflow: "CD", Event: "pull_request", State: CheckFail, Detail: "timed out"},
+		{Name: "label", State: CheckSkipped, Detail: "skipped"},
+		{Name: "ci/jenkins", State: CheckFail, Detail: "Build broke", URL: "https://jenkins.test/1", StartedAt: "2026-09-01T10:00:00Z"},
+		{Name: "ci/other", State: CheckPending, Detail: "expected"},
+	}
+	if len(checks) != len(want) {
+		t.Fatalf("got %d checks, want %d: %+v", len(checks), len(want), checks)
+	}
+	for i := range want {
+		if checks[i] != want[i] {
+			t.Errorf("check %d =\n  %+v\nwant\n  %+v", i, checks[i], want[i])
+		}
+	}
+}
+
+func TestChecksPages(t *testing.T) {
+	run := func(name string) string {
+		return `{"__typename":"CheckRun","name":"` + name + `","status":"COMPLETED","conclusion":"SUCCESS"}`
+	}
+	client, fake := fakeClient(t, checksPage(run("one"), true), checksPage(run("two"), false))
+	_, checks, err := client.Checks("o", "r", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.requests) != 2 || fake.requests[1].Variables["cursor"] != "p1" {
+		t.Fatalf("expected a second request with cursor p1, got %+v", fake.requests)
+	}
+	if len(checks) != 2 || checks[1].Name != "two" {
+		t.Errorf("checks from later pages are lost: %+v", checks)
+	}
+}
+
+func TestChecksWithoutRollupIsEmpty(t *testing.T) {
+	client, _ := fakeClient(t, `{"data":{"repository":{"pullRequest":{"commits":{"nodes":[
+	  {"commit":{"oid":"abc","statusCheckRollup":null}}]}}}}}`)
+	sha, checks, err := client.Checks("o", "r", 7)
+	if err != nil || sha != "abc" || len(checks) != 0 {
+		t.Errorf("Checks = %q, %+v, %v; want the sha and no checks", sha, checks, err)
+	}
+}
+
+func TestChecksError(t *testing.T) {
+	client, _ := fakeClient(t, `{"errors":[{"message":"Resource not accessible by integration"}]}`)
+	if _, _, err := client.Checks("o", "r", 7); err == nil || !strings.Contains(err.Error(), "fetching checks") {
+		t.Errorf("err = %v, want a wrapped GraphQL error", err)
+	}
+}
+
+func TestCheckLabel(t *testing.T) {
+	if got := (Check{Workflow: "CI", Name: "build"}).Label(); got != "CI / build" {
+		t.Errorf("Label() = %q", got)
+	}
+	if got := (Check{Name: "ci/jenkins"}).Label(); got != "ci/jenkins" {
+		t.Errorf("Label() = %q", got)
+	}
+}

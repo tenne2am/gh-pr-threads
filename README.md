@@ -7,7 +7,8 @@ on github.com without leaving the terminal.
 The left pane lists the threads (`file.go:42` plus the first line of the opening
 comment); the right pane shows the code the thread was opened on (as a coloured diff) followed
 by the whole conversation for the selected thread.
-Resolved threads are hidden until you press `a`.
+Resolved threads are hidden until you press `a`. The header also sums up the PR's CI
+(e.g. `✗ 1 failing`), and `w` lists the workflow runs behind it.
 
 ## Install
 
@@ -105,6 +106,30 @@ The quote starts on its own line and leaves the cursor below it, so you can keep
 typing. If the code itself contains backticks, a longer fence is used. Tabs in the
 code become spaces, because the reply box can't hold tab characters.
 
+## Checks view
+
+Press `w` to swap the thread panes for the CI results on the PR's head commit — the
+same list as `gh pr checks`: GitHub Actions jobs (shown as `Workflow / job`), other
+apps' check runs, and commit statuses from external CI.
+
+```
+✗ CI / test                                failure · 3m12s
+● CI / build                       in progress · running 1m04s
+✓ CI / lint                                    success · 42s
+✓ ci/jenkins                                    Build passed
+- PR Triaging / label                                skipped
+checks on abc1234 · j/k move · o open run · R refresh checks · esc back
+```
+
+* Failing checks come first, then pending, passed and skipped, each sorted by name.
+* Each row shows GitHub's own state (`failure`, `cancelled`, `timed out`, `queued`, …)
+  and how long the job took, or how long it has been running.
+* `o` (or `enter`) opens the selected run's page — its logs — on github.com.
+* `R` re-fetches the checks, e.g. after a re-run; `R` in the thread view refreshes both.
+* The checks are fetched separately from the threads, so if they can't be read (for
+  example a token without access to the repository's Actions), the error shows in the
+  checks view and the threads keep working.
+
 ## Keys
 
 **Browsing**
@@ -120,8 +145,9 @@ code become spaces, because the reply box can't hold tab characters.
 | `v` | select lines of the diff to quote |
 | `t` | resolve / unresolve the selected thread |
 | `a` | show or hide resolved threads |
+| `w` | show the CI checks / workflow runs |
 | `o` | open the thread on github.com |
-| `R`, `ctrl+r` | reload |
+| `R`, `ctrl+r` | reload threads and checks |
 | `q`, `esc`, `ctrl+c` | quit |
 
 **Selecting diff lines** (after `v`)
@@ -135,6 +161,16 @@ code become spaces, because the reply box can't hold tab characters.
 | `J` / `K`, `ctrl+d` / `ctrl+u` | scroll the pane |
 | `enter`, `Q`, `r` | reply with the selected lines quoted |
 | `esc`, `v`, `q` | back to browsing |
+
+**Checks view** (after `w`)
+
+| Key | Action |
+| --- | --- |
+| `j` / `k`, `↓` / `↑` | move between checks |
+| `g` / `G`, `home` / `end` | first / last check |
+| `o`, `enter` | open the run on github.com |
+| `R`, `ctrl+r` | refresh the checks |
+| `esc`, `w`, `q` | back to the threads |
 
 **Replying**
 
@@ -173,8 +209,10 @@ and read the screen. API calls go to an in-process mock of the GitHub GraphQL AP
 go-gh talks to the development host `github.localhost` over plain HTTP, so
 `GH_HOST=github.localhost` plus `HTTP_PROXY` pointing at the mock routes every request
 there, with no test hooks in the extension. The mock keeps state (replies and
-resolutions show up on reload) and, like GitHub, only returns `diffHunk` when the query
-asks for it. A stand-in `gh` (via `GH_PATH`) covers finding the current branch's PR.
+resolutions show up on reload, checks can be changed between refreshes) and, like
+GitHub, only returns `diffHunk` when the query asks for it. A stand-in `gh` (via
+`GH_PATH`) covers finding the current branch's PR, and a stand-in browser (via
+`GH_BROWSER`) records the URLs `o` opens.
 They need a Unix-like OS for the pseudo-terminal.
 
 ## How it works
@@ -188,6 +226,10 @@ They need a Unix-like OS for the pseudo-terminal.
 * The code shown above each conversation is the opening comment's `diffHunk`. It ends at
   the commented line, so by default only the commented range and 3 lines of context
   above it are shown, like on github.com; `d` shows the whole hunk.
+* Checks come from the head commit's `statusCheckRollup.contexts`, a union of
+  `CheckRun` (GitHub Actions jobs carry their workflow via `checkSuite.workflowRun`) and
+  `StatusContext`. Conclusions are bucketed into fail / pending / pass / skipped the way
+  `gh pr checks` does.
 * Replies use the `addPullRequestReviewThreadReply` mutation; resolving uses
   `resolveReviewThread` / `unresolveReviewThread`.
 * The TUI is [Bubble Tea](https://github.com/charmbracelet/bubbletea) — the same stack

@@ -1,9 +1,12 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -597,5 +600,199 @@ func TestSelectionEndsWhenThreadLosesDiff(t *testing.T) {
 	n, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	if n.(model).mode == modeReply {
 		t.Error("enter should not open a quote reply for a thread without a diff")
+	}
+}
+
+func checksFixture() []Check {
+	return []Check{
+		{Workflow: "CI", Name: "lint", State: CheckPass, Detail: "success",
+			StartedAt: "2026-09-01T10:00:00Z", CompletedAt: "2026-09-01T10:00:42Z", URL: "https://example.test/lint"},
+		{Workflow: "PR Triaging", Name: "label", State: CheckSkipped, Detail: "skipped",
+			StartedAt: "2026-09-01T10:00:10Z", CompletedAt: "2026-09-01T10:00:05Z"},
+		{Workflow: "CI", Name: "test", State: CheckFail, Detail: "failure",
+			StartedAt: "2026-09-01T10:00:00Z", CompletedAt: "2026-09-01T10:03:12Z", URL: "https://example.test/test"},
+		{Workflow: "CI", Name: "build", State: CheckPending, Detail: "in progress", StartedAt: "2026-09-01T10:00:00Z"},
+	}
+}
+
+func withChecks(t *testing.T, checks []Check) model {
+	t.Helper()
+	n, _ := load(t).Update(checksMsg{sha: "abc1234def", checks: checks})
+	return n.(model)
+}
+
+func TestSortChecksPutsFailuresFirst(t *testing.T) {
+	var got []string
+	for _, c := range sortChecks(checksFixture()) {
+		got = append(got, c.Label())
+	}
+	want := []string{"CI / test", "CI / build", "CI / lint", "PR Triaging / label"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("order = %q, want %q", got, want)
+	}
+}
+
+func TestChecksSummary(t *testing.T) {
+	pass := Check{State: CheckPass}
+	cases := []struct {
+		checks []Check
+		want   string
+	}{
+		{nil, ""},
+		{[]Check{pass, {State: CheckSkipped}}, "✓ 1 passed"},
+		{[]Check{pass, {State: CheckPending}}, "● 1 pending"},
+		{[]Check{pass, {State: CheckPending}, {State: CheckFail}, {State: CheckFail}}, "✗ 2 failing"},
+		{[]Check{{State: CheckSkipped}, {State: CheckSkipped}}, "- 2 skipped"},
+	}
+	for _, c := range cases {
+		if got := plain(checksSummary(c.checks)); got != c.want {
+			t.Errorf("checksSummary(%v) = %q, want %q", c.checks, got, c.want)
+		}
+	}
+}
+
+func TestCheckTiming(t *testing.T) {
+	now, _ := time.Parse(time.RFC3339, "2026-09-01T10:05:00Z")
+	fx := checksFixture()
+	cases := []struct {
+		c    Check
+		want string
+	}{
+		{fx[0], "42s"},
+		{fx[2], "3m12s"},
+		{fx[3], "running 5m00s"},
+		{fx[1], ""}, // skipped, and its start is after its end
+		{Check{State: CheckPending}, ""},
+	}
+	for _, c := range cases {
+		if got := checkTiming(c.c, now); got != c.want {
+			t.Errorf("checkTiming(%s) = %q, want %q", c.c.Label(), got, c.want)
+		}
+	}
+	if got := formatDuration(2*time.Hour + 3*time.Minute); got != "2h03m" {
+		t.Errorf("formatDuration = %q", got)
+	}
+}
+
+func TestChecksInHeader(t *testing.T) {
+	v := plain(withChecks(t, checksFixture()).View())
+	if !strings.Contains(v, "2 open / 3 total · ✗ 1 failing") {
+		t.Errorf("header should summarise the checks\n---\n%s", v)
+	}
+	if v := plain(load(t).View()); strings.Contains(v, "total ·") {
+		t.Errorf("no summary before the checks have loaded\n---\n%s", v)
+	}
+}
+
+func TestChecksViewLifecycle(t *testing.T) {
+	m := key(withChecks(t, checksFixture()), "w")
+	if m.mode != modeChecks {
+		t.Fatal("w should open the checks view")
+	}
+	v := plain(m.View())
+	for _, want := range []string{"✗ CI / test", "failure · 3m12s", "● CI / build", "✓ CI / lint", "- PR Triaging / label", "checks on abc1234"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("checks view missing %q\n---\n%s", want, v)
+		}
+	}
+	if strings.Contains(v, "this needs a nil check") {
+		t.Error("the checks view should replace the thread panes")
+	}
+	if first := strings.SplitN(plain(m.viewChecks()), "\n", 2)[0]; !strings.Contains(first, "CI / test") {
+		t.Errorf("the failing check should be listed first, got %q", first)
+	}
+
+	if m = key(m, "j"); m.checkCursor != 1 {
+		t.Errorf("j: cursor = %d, want 1", m.checkCursor)
+	}
+	if m = key(m, "G"); m.checkCursor != 3 {
+		t.Errorf("G: cursor = %d, want 3", m.checkCursor)
+	}
+	if m = key(m, "j"); m.checkCursor != 3 {
+		t.Errorf("j past the end: cursor = %d, want 3", m.checkCursor)
+	}
+	if m = key(m, "g"); m.checkCursor != 0 {
+		t.Errorf("g: cursor = %d, want 0", m.checkCursor)
+	}
+
+	for _, k := range []string{"w", "q"} {
+		if back := key(m, k); back.mode != modeBrowse {
+			t.Errorf("%s should go back to the threads", k)
+		}
+	}
+	n, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if n.(model).mode != modeBrowse {
+		t.Error("esc should go back to the threads")
+	}
+	if !strings.Contains(n.(model).View(), "this needs a nil check") {
+		t.Error("threads should be back after leaving the checks view")
+	}
+}
+
+func TestChecksViewQuitAndRefresh(t *testing.T) {
+	m := key(withChecks(t, checksFixture()), "w")
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	if cmd == nil {
+		t.Fatal("ctrl+c should quit")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Error("ctrl+c should return tea.Quit")
+	}
+
+	n, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("R")})
+	m = n.(model)
+	if cmd == nil || m.checksLoaded {
+		t.Error("R should refetch the checks")
+	}
+	if !strings.Contains(m.View(), "loading checks") {
+		t.Errorf("expected a loading message, got:\n%s", m.View())
+	}
+}
+
+func TestChecksViewStates(t *testing.T) {
+	if v := key(load(t), "w").View(); !strings.Contains(v, "loading checks") {
+		t.Errorf("before the checks arrive, got:\n%s", v)
+	}
+	if v := key(withChecks(t, nil), "w").View(); !strings.Contains(v, "No checks have run") {
+		t.Errorf("with no checks, got:\n%s", v)
+	}
+	n, _ := load(t).Update(checksMsg{err: errors.New("fetching checks: forbidden")})
+	m := n.(model)
+	if m.status != "" {
+		t.Error("a checks error must not take over the footer of the threads view")
+	}
+	if v := key(m, "w").View(); !strings.Contains(v, "fetching checks: forbidden") {
+		t.Errorf("the checks view should show the error, got:\n%s", v)
+	}
+}
+
+func TestChecksRowsAreAligned(t *testing.T) {
+	long := Check{Workflow: "Unit and Integration Tests", Name: strings.Repeat("integration-tests ", 10), State: CheckPass, Detail: "success"}
+	m := key(withChecks(t, append(checksFixture(), long)), "w")
+	lines := strings.Split(m.viewChecks(), "\n")
+	for _, l := range lines[:5] {
+		if w := lipgloss.Width(l); w != m.width-1 {
+			t.Errorf("row is %d wide, want %d so the right column lines up: %q", w, m.width-1, plain(l))
+		}
+	}
+	if !strings.Contains(plain(m.viewChecks()), "…") {
+		t.Error("an over-long name should be truncated")
+	}
+}
+
+func TestChecksViewScrolls(t *testing.T) {
+	many := make([]Check, 80)
+	for i := range many {
+		many[i] = Check{Name: fmt.Sprintf("job-%02d", i), State: CheckPass}
+	}
+	m := key(withChecks(t, many), "w")
+	for range 60 {
+		m = key(m, "j")
+	}
+	if m.checkCursor < m.checkOffset || m.checkCursor >= m.checkOffset+m.bodyHeight() {
+		t.Fatalf("cursor %d outside window [%d,%d)", m.checkCursor, m.checkOffset, m.checkOffset+m.bodyHeight())
+	}
+	if !strings.Contains(m.View(), "job-60") {
+		t.Error("the selected check should be on screen")
 	}
 }

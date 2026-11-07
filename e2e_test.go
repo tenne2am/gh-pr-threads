@@ -55,12 +55,30 @@ func TestMain(m *testing.M) {
 type mockGitHub struct {
 	t *testing.T
 
-	mu        sync.Mutex
-	title     string
-	threads   []Thread
-	requests  []graphQLRequest
-	failReply bool
-	nextID    int
+	mu         sync.Mutex
+	title      string
+	threads    []Thread
+	requests   []graphQLRequest
+	failReply  bool
+	failChecks bool
+	nextID     int
+
+	headSHA string
+	checks  []map[string]interface{} // raw CheckRun / StatusContext nodes
+}
+
+func checkRun(workflow, name, status, conclusion, url string) map[string]interface{} {
+	run := map[string]interface{}{
+		"__typename": "CheckRun", "name": name, "status": status, "detailsUrl": url,
+		"startedAt": "2026-09-01T10:00:00Z", "completedAt": nil, "conclusion": nil,
+		"checkSuite": map[string]interface{}{"workflowRun": map[string]interface{}{
+			"event": "pull_request", "workflow": map[string]interface{}{"name": workflow}}},
+	}
+	if status == "COMPLETED" {
+		run["conclusion"] = conclusion
+		run["completedAt"] = "2026-09-01T10:03:12Z"
+	}
+	return run
 }
 
 func newMockGitHub(t *testing.T) *mockGitHub {
@@ -80,6 +98,14 @@ func newMockGitHub(t *testing.T) *mockGitHub {
 			mk("T1", "main.go", 12, false, sampleHunk, "this needs a nil check"),
 			mk("T2", "ui.go", 40, false, "@@ -38,3 +38,4 @@ func view() {\n \tleft := 1\n+\tpanes := 2", "why two panes here?"),
 			mk("T3", "old.go", 7, true, "@@ -7 +7 @@\n+\tdone()", "already handled"),
+		},
+		headSHA: "abc1234def5678",
+		checks: []map[string]interface{}{
+			checkRun("CI", "lint", "COMPLETED", "SUCCESS", "https://github.com/octo/demo/actions/runs/1/job/1"),
+			checkRun("CI", "test", "COMPLETED", "FAILURE", "https://github.com/octo/demo/actions/runs/1/job/2"),
+			checkRun("CI", "build", "IN_PROGRESS", "", "https://github.com/octo/demo/actions/runs/1/job/3"),
+			{"__typename": "StatusContext", "context": "ci/jenkins", "state": "SUCCESS",
+				"targetUrl": "https://jenkins.test/1", "description": "Build passed", "createdAt": "2026-09-01T10:00:00Z"},
 		},
 	}
 }
@@ -119,6 +145,21 @@ func (g *mockGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			resp.Repository.PullRequest.ReviewThreads.Nodes = withoutHunks(g.threads)
 		}
 		data = resp
+
+	case strings.Contains(req.Query, "query PRChecks"):
+		if g.failChecks {
+			writeJSON(w, map[string]interface{}{"errors": []map[string]string{{"message": "checks not available to mock token"}}})
+			return
+		}
+		data = map[string]interface{}{"repository": map[string]interface{}{"pullRequest": map[string]interface{}{
+			"commits": map[string]interface{}{"nodes": []interface{}{map[string]interface{}{"commit": map[string]interface{}{
+				"oid": g.headSHA,
+				"statusCheckRollup": map[string]interface{}{"contexts": map[string]interface{}{
+					"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+					"nodes":    g.checks,
+				}},
+			}}}},
+		}}}
 
 	case strings.Contains(req.Query, "addPullRequestReviewThreadReply"):
 		if g.failReply {
@@ -341,6 +382,7 @@ const (
 	keyEnter = "\r"
 	keyCtrlS = "\x13"
 	keyCtrlQ = "\x11"
+	keyEsc   = "\x1b"
 )
 
 // --- scenarios --------------------------------------------------------------
@@ -467,6 +509,76 @@ func TestE2EReplyErrorIsShown(t *testing.T) {
 	term.expect("```diff")
 	term.send(keyCtrlS)
 	term.expect("reply rejected by mock")
+}
+
+func TestE2EChecksView(t *testing.T) {
+	// A stand-in browser that records the URLs it is asked to open.
+	dir := t.TempDir()
+	opened := filepath.Join(dir, "opened")
+	browser := filepath.Join(dir, "browser")
+	if err := os.WriteFile(browser, []byte("#!/bin/sh\necho \"$1\" >> "+opened+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	gh := newMockGitHub(t)
+	term := startApp(t, gh, []string{"7", "--repo", "octo/demo"}, "GH_BROWSER="+browser)
+	term.expect("✗ 1 failing")
+
+	term.send("w")
+	term.expect("checks on abc1234")
+	term.expect("✗ CI / test")
+	term.expect("failure · 3m12s")
+	term.expect("● CI / build")
+	term.expect("✓ ci/jenkins")
+	term.expect("Build passed")
+
+	// Failures sort first, so one step down is the running build.
+	term.send("j")
+	term.expect("CI / build")
+	term.send("o")
+	waitFor(t, func() bool {
+		b, _ := os.ReadFile(opened)
+		return strings.TrimSpace(string(b)) == "https://github.com/octo/demo/actions/runs/1/job/3"
+	}, "o should open the selected check's run in the browser")
+
+	// The re-run goes green on GitHub; R picks it up.
+	gh.mu.Lock()
+	gh.checks[1] = checkRun("CI", "test", "COMPLETED", "SUCCESS", "https://github.com/octo/demo/actions/runs/2/job/2")
+	gh.checks[2] = checkRun("CI", "build", "COMPLETED", "SUCCESS", "https://github.com/octo/demo/actions/runs/1/job/3")
+	gh.mu.Unlock()
+	term.send("R")
+	term.expect("✓ 4 passed")
+	if n := gh.count("PRChecks"); n != 2 {
+		t.Errorf("checks queried %d times, want 2", n)
+	}
+
+	term.send(keyEsc)
+	term.expect("this needs a nil check")
+}
+
+func TestE2EChecksErrorKeepsThreadsWorking(t *testing.T) {
+	gh := newMockGitHub(t)
+	gh.checks = nil
+	gh.failChecks = true
+	term := startApp(t, gh, []string{"7", "--repo", "octo/demo"})
+	term.expect("this needs a nil check")
+
+	term.send("w")
+	term.expect("checks not available to mock token")
+	term.send(keyEsc)
+	term.expect("this needs a nil check")
+}
+
+// waitFor polls cond until it holds or the test times out.
+func waitFor(t *testing.T, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal(msg)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func TestE2EPRForCurrentBranch(t *testing.T) {

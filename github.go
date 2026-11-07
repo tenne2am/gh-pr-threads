@@ -220,3 +220,214 @@ func (c *Client) SetResolved(threadID string, resolved bool) error {
 	}
 	return nil
 }
+
+// Check is one CI result on the pull request's head commit: a GitHub Actions
+// job (or another app's check run), or a commit status from an external CI.
+type Check struct {
+	Name     string // job name, or the status context
+	Workflow string // Actions workflow name; empty for non-Actions checks
+	Event    string // what triggered the workflow run, e.g. "pull_request"
+	State    CheckState
+	// Detail is GitHub's own word for the state, e.g. "cancelled" or
+	// "in progress", or a commit status's description.
+	Detail      string
+	URL         string
+	StartedAt   string
+	CompletedAt string
+}
+
+// CheckState buckets the many check conclusions the way `gh pr checks` does.
+type CheckState int
+
+const (
+	CheckFail CheckState = iota
+	CheckPending
+	CheckPass
+	CheckSkipped
+)
+
+// Label is "Workflow / job" for Actions jobs and just the name otherwise.
+func (c Check) Label() string {
+	if c.Workflow == "" {
+		return c.Name
+	}
+	return c.Workflow + " / " + c.Name
+}
+
+const checksQuery = `
+query PRChecks($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      commits(last: 1) {
+        nodes {
+          commit {
+            oid
+            statusCheckRollup {
+              contexts(first: 100, after: $cursor) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  __typename
+                  ... on CheckRun {
+                    name
+                    status
+                    conclusion
+                    detailsUrl
+                    startedAt
+                    completedAt
+                    checkSuite { workflowRun { event workflow { name } } }
+                  }
+                  ... on StatusContext {
+                    context
+                    state
+                    targetUrl
+                    description
+                    createdAt
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}`
+
+// checkContext holds either member of the CheckRun | StatusContext union.
+type checkContext struct {
+	Typename string `json:"__typename"`
+
+	// CheckRun
+	Name        string `json:"name"`
+	Status      string `json:"status"`
+	Conclusion  string `json:"conclusion"`
+	DetailsURL  string `json:"detailsUrl"`
+	StartedAt   string `json:"startedAt"`
+	CompletedAt string `json:"completedAt"`
+	CheckSuite  struct {
+		WorkflowRun *struct {
+			Event    string `json:"event"`
+			Workflow struct {
+				Name string `json:"name"`
+			} `json:"workflow"`
+		} `json:"workflowRun"`
+	} `json:"checkSuite"`
+
+	// StatusContext
+	Context     string `json:"context"`
+	State       string `json:"state"`
+	TargetURL   string `json:"targetUrl"`
+	Description string `json:"description"`
+	CreatedAt   string `json:"createdAt"`
+}
+
+type checksResponse struct {
+	Repository struct {
+		PullRequest struct {
+			Commits struct {
+				Nodes []struct {
+					Commit struct {
+						Oid               string `json:"oid"`
+						StatusCheckRollup *struct {
+							Contexts struct {
+								PageInfo struct {
+									HasNextPage bool   `json:"hasNextPage"`
+									EndCursor   string `json:"endCursor"`
+								} `json:"pageInfo"`
+								Nodes []checkContext `json:"nodes"`
+							} `json:"contexts"`
+						} `json:"statusCheckRollup"`
+					} `json:"commit"`
+				} `json:"nodes"`
+			} `json:"commits"`
+		} `json:"pullRequest"`
+	} `json:"repository"`
+}
+
+// Checks pages through the CI results on the pull request's head commit and
+// returns that commit's SHA with them. A commit nothing has run on yet has no
+// status rollup, which is an empty list rather than an error.
+func (c *Client) Checks(owner, repo string, number int) (string, []Check, error) {
+	vars := map[string]interface{}{
+		"owner":  owner,
+		"repo":   repo,
+		"number": number,
+		"cursor": (*string)(nil),
+	}
+
+	var sha string
+	var all []Check
+	for {
+		var resp checksResponse
+		if err := c.gql.Do(checksQuery, vars, &resp); err != nil {
+			return "", nil, fmt.Errorf("fetching checks: %w", err)
+		}
+		commits := resp.Repository.PullRequest.Commits.Nodes
+		if len(commits) == 0 {
+			return "", nil, nil
+		}
+		sha = commits[0].Commit.Oid
+		rollup := commits[0].Commit.StatusCheckRollup
+		if rollup == nil {
+			return sha, nil, nil
+		}
+		for _, ctx := range rollup.Contexts.Nodes {
+			all = append(all, ctx.toCheck())
+		}
+		if !rollup.Contexts.PageInfo.HasNextPage {
+			break
+		}
+		cursor := rollup.Contexts.PageInfo.EndCursor
+		vars["cursor"] = &cursor
+	}
+	return sha, all, nil
+}
+
+func (ctx checkContext) toCheck() Check {
+	if ctx.Typename == "StatusContext" {
+		c := Check{
+			Name:      ctx.Context,
+			Detail:    ctx.Description,
+			URL:       ctx.TargetURL,
+			StartedAt: ctx.CreatedAt,
+		}
+		switch ctx.State {
+		case "SUCCESS":
+			c.State = CheckPass
+		case "PENDING", "EXPECTED":
+			c.State = CheckPending
+		default: // FAILURE, ERROR
+			c.State = CheckFail
+		}
+		if c.Detail == "" {
+			c.Detail = strings.ToLower(ctx.State)
+		}
+		return c
+	}
+
+	c := Check{
+		Name:        ctx.Name,
+		URL:         ctx.DetailsURL,
+		StartedAt:   ctx.StartedAt,
+		CompletedAt: ctx.CompletedAt,
+	}
+	if run := ctx.CheckSuite.WorkflowRun; run != nil {
+		c.Workflow = run.Workflow.Name
+		c.Event = run.Event
+	}
+	if ctx.Status != "COMPLETED" {
+		c.State = CheckPending
+		c.Detail = strings.ToLower(strings.ReplaceAll(ctx.Status, "_", " "))
+		return c
+	}
+	switch ctx.Conclusion {
+	case "SUCCESS":
+		c.State = CheckPass
+	case "SKIPPED", "NEUTRAL":
+		c.State = CheckSkipped
+	default: // FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED, STARTUP_FAILURE, STALE
+		c.State = CheckFail
+	}
+	c.Detail = strings.ToLower(strings.ReplaceAll(ctx.Conclusion, "_", " "))
+	return c
+}
