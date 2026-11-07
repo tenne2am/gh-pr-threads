@@ -150,7 +150,8 @@ Requires Go (see `go.mod` for the version).
 
 ```sh
 go build -o gh-pr-threads .   # build
-go test ./...                 # run the tests
+go test ./...                 # unit tests
+go test -tags e2e ./...       # also end-to-end tests (see below)
 gh extension install .        # install this checkout as `gh pr-threads`
 gh pr-threads                 # run it
 ```
@@ -165,6 +166,16 @@ no reinstall needed. `gh extension remove pr-threads` when you're done.
 | [`ui.go`](ui.go) | the Bubble Tea model, key handling, and rendering |
 | [`ui_test.go`](ui_test.go) | model tests driven by synthetic messages (no network) |
 | [`github_test.go`](github_test.go) | GraphQL client tests against a fake HTTP transport |
+| [`e2e_test.go`](e2e_test.go) | end-to-end tests: the real binary in a pseudo-terminal against a mock GitHub |
+
+The end-to-end tests build the binary, run it in a pseudo-terminal, send keystrokes,
+and read the screen. API calls go to an in-process mock of the GitHub GraphQL API:
+go-gh talks to the development host `github.localhost` over plain HTTP, so
+`GH_HOST=github.localhost` plus `HTTP_PROXY` pointing at the mock routes every request
+there, with no test hooks in the extension. The mock keeps state (replies and
+resolutions show up on reload) and, like GitHub, only returns `diffHunk` when the query
+asks for it. A stand-in `gh` (via `GH_PATH`) covers finding the current branch's PR.
+They need a Unix-like OS for the pseudo-terminal.
 
 ## How it works
 
