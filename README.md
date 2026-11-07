@@ -164,6 +164,7 @@ no reinstall needed. `gh extension remove pr-threads` when you're done.
 | [`github.go`](github.go) | GraphQL queries and mutations |
 | [`ui.go`](ui.go) | the Bubble Tea model, key handling, and rendering |
 | [`ui_test.go`](ui_test.go) | model tests driven by synthetic messages (no network) |
+| [`github_test.go`](github_test.go) | GraphQL client tests against a fake HTTP transport |
 
 ## How it works
 

@@ -434,3 +434,168 @@ func TestSelectionCursorScrollsIntoView(t *testing.T) {
 		t.Errorf("after g the pane should be back near the top, YOffset = %d", m.detail.YOffset)
 	}
 }
+
+func TestDiffStart(t *testing.T) {
+	single := Thread{Line: line(12)}
+	multi := Thread{StartLine: line(10), Line: line(14)}
+	cases := []struct {
+		name string
+		t    Thread
+		n    int
+		full bool
+		want int
+	}{
+		{"compact keeps commented line + context", single, 8, false, 4},
+		{"full shows everything", single, 8, true, 0},
+		{"short hunk is not trimmed", single, 3, false, 0},
+		{"range widens the compact view", multi, 20, false, 12},
+		{"no line numbers falls back to one line", Thread{}, 8, false, 4},
+		{"empty hunk", single, 0, false, 0},
+	}
+	for _, c := range cases {
+		if got := diffStart(c.t, c.n, c.full); got != c.want {
+			t.Errorf("%s: diffStart = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+func TestRenderDiffExpandsTabsAndTruncates(t *testing.T) {
+	th := Thread{}
+	th.Comments.Nodes = []Comment{{DiffHunk: "@@ -1 +1 @@\n+\tsomething quite long here"}}
+	got := plain(renderDiff(th, 12, true, nil))
+	if strings.Contains(got, "\t") {
+		t.Error("tabs should be expanded so widths line up")
+	}
+	for _, l := range strings.Split(got, "\n") {
+		if lipgloss.Width(l) > 12 {
+			t.Errorf("line %q is wider than the pane", l)
+		}
+	}
+	// The selection gutter takes two columns from the same width.
+	for _, l := range strings.Split(plain(renderDiff(th, 12, true, &lineRange{0, 0})), "\n") {
+		if lipgloss.Width(l) > 12 {
+			t.Errorf("line %q with gutter is wider than the pane", l)
+		}
+	}
+}
+
+func TestRenderDiffWithoutHeader(t *testing.T) {
+	th := Thread{Line: line(1)}
+	th.Comments.Nodes = []Comment{{DiffHunk: "+only\n+lines"}}
+	got := plain(renderDiff(th, 80, false, nil))
+	if got != "+only\n+lines" {
+		t.Errorf("renderDiff = %q, want the lines unchanged and no elision marker", got)
+	}
+}
+
+func TestFenceDiffEmpty(t *testing.T) {
+	if got := fenceDiff(nil); got != "" {
+		t.Errorf("fenceDiff(nil) = %q, want empty", got)
+	}
+}
+
+func TestQuoteAfterNewlineAddsNoBlankLine(t *testing.T) {
+	m := key(withHunk(t), "r")
+	m.reply.InsertString("see:\n")
+	n, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlQ})
+	if v := n.(model).reply.Value(); !strings.HasPrefix(v, "see:\n```diff\n") {
+		t.Errorf("quote should follow the existing newline directly, got %q", v)
+	}
+}
+
+func TestCtrlQWithoutHunkKeepsDraft(t *testing.T) {
+	m := key(key(load(t), "r"), "hi")
+	n, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlQ})
+	m = n.(model)
+	if m.reply.Value() != "hi" {
+		t.Errorf("draft changed to %q", m.reply.Value())
+	}
+	if m.mode != modeReply || !strings.Contains(m.View(), "no diff to quote") {
+		t.Errorf("should warn and stay in reply mode, got:\n%s", m.View())
+	}
+}
+
+func TestSelectionJumpKeys(t *testing.T) {
+	m := key(withHunk(t), "v")
+	if m = key(m, "g"); m.selCursor != 4 {
+		t.Errorf("g: cursor = %d, want 4 (first shown line)", m.selCursor)
+	}
+	if m = key(m, "G"); m.selCursor != 7 {
+		t.Errorf("G: cursor = %d, want 7 (last line)", m.selCursor)
+	}
+	if m = key(m, "j"); m.selCursor != 7 {
+		t.Errorf("j past the end: cursor = %d, want 7", m.selCursor)
+	}
+}
+
+func TestSelectionConfirmKeys(t *testing.T) {
+	for _, k := range []string{"Q", "r"} {
+		m := key(key(key(withHunk(t), "v"), "k"), k)
+		if m.mode != modeReply {
+			t.Fatalf("%s should open the reply", k)
+		}
+		want := "```diff\n+\t\treturn nil\n+\t}\n```"
+		if got := m.reply.Value(); collapse(got) != collapse(want) {
+			t.Errorf("%s: reply = %q, want %q", k, got, want)
+		}
+	}
+}
+
+func TestSelectFromFullHunk(t *testing.T) {
+	m := key(key(key(withHunk(t), "d"), "v"), "g")
+	m = enter(m)
+	if !strings.Contains(m.reply.Value(), "a := 1") {
+		t.Errorf("selection in the full hunk should reach its first line, got %q", m.reply.Value())
+	}
+}
+
+func TestSelectionExitAndQuitKeys(t *testing.T) {
+	for _, k := range []string{"v", "q"} {
+		m := key(key(withHunk(t), "v"), k)
+		if m.mode != modeBrowse {
+			t.Errorf("%s should go back to browsing", k)
+		}
+	}
+	// q must not quit from selection, but ctrl+c must.
+	_, cmd := key(withHunk(t), "v").Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	if cmd != nil {
+		t.Error("q in selection mode should not issue a command")
+	}
+	_, cmd = key(withHunk(t), "v").Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	if cmd == nil {
+		t.Fatal("ctrl+c should quit")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Error("ctrl+c should return tea.Quit")
+	}
+}
+
+func TestSelectionScrollKeysKeepSelection(t *testing.T) {
+	m := key(key(withHunk(t), "v"), "k")
+	before := m.selection()
+	for _, k := range []string{"J", "K"} {
+		if m = key(m, k); m.selection() != before || m.mode != modeDiff {
+			t.Errorf("%s changed the selection or mode", k)
+		}
+	}
+}
+
+func TestSelectionFooter(t *testing.T) {
+	if v := key(withHunk(t), "v").View(); !strings.Contains(v, "enter quote+reply") {
+		t.Errorf("footer should list the selection keys, got:\n%s", v)
+	}
+}
+
+func TestSelectionEndsWhenThreadLosesDiff(t *testing.T) {
+	m := key(withHunk(t), "v")
+	// Resolving T1 hides it, so the cursor lands on T2, which has no hunk.
+	n, _ := m.Update(resolvedMsg{threadID: "T1", resolved: true})
+	m = n.(model)
+	if m.mode != modeBrowse {
+		t.Error("selection mode should end when the thread has no diff")
+	}
+	n, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if n.(model).mode == modeReply {
+		t.Error("enter should not open a quote reply for a thread without a diff")
+	}
+}
