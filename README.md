@@ -36,6 +36,35 @@ gh pr-threads 123 --repo cli/cli # a PR in another repository
 
 With no number, the PR is found with `gh pr view` for the current branch.
 
+## Diff view
+
+Above each conversation, the detail pane shows the code the thread was left on, so you
+can read a comment in context without opening the browser:
+
+```
+main.go:14-16  open
+
+@@ -10,6 +10,8 @@ func run() error {
+⋮
+ 	d := 4
+-	old()
++	if x == nil {
++		return nil
++	}
+
+@alice  2d ago
+this needs a nil check
+```
+
+* Added lines are green, removed lines red, and the `@@` hunk header is highlighted.
+* By default only the commented lines and the 3 lines above them are shown, as on
+  github.com. `⋮` marks where earlier lines of the hunk were left out.
+* Press `d` to toggle between this compact view and the full hunk; the setting stays
+  as you move between threads.
+* Threads on outdated code show the hunk as it was when the comment was written.
+* Long lines are cut at the pane width rather than wrapped, so the code keeps its
+  shape; use `o` to see the full line on github.com.
+
 ## Keys
 
 **Browsing**
