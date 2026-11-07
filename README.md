@@ -84,6 +84,23 @@ github.com renders with diff colours:
 ```
 ````
 
+To quote only some of the lines, press `v` to pick them first:
+
+```
+@@ -10,6 +10,8 @@ func run() error {
+⋮
+  -	old()
+▌ +	if x == nil {      ← selected
+▌ +		return nil     ← selected
+  +	}
+```
+
+* The selection starts on the commented line(s), as github.com highlights them.
+* `j` / `k` move the end of the selection; `space` restarts it at the current line.
+* `d` still switches to the full hunk, so you can select lines above the compact view.
+* `enter` (or `Q` / `r`) opens the reply with only the selected lines quoted; `esc`
+  goes back without replying.
+
 The quote starts on its own line and leaves the cursor below it, so you can keep
 typing. If the code itself contains backticks, a longer fence is used. Tabs in the
 code become spaces, because the reply box can't hold tab characters.
@@ -100,11 +117,24 @@ code become spaces, because the reply box can't hold tab characters.
 | `d` | show the full diff hunk / only the commented lines |
 | `r` | reply to the selected thread |
 | `Q` | reply with the diff quoted |
+| `v` | select lines of the diff to quote |
 | `t` | resolve / unresolve the selected thread |
 | `a` | show or hide resolved threads |
 | `o` | open the thread on github.com |
 | `R`, `ctrl+r` | reload |
 | `q`, `esc`, `ctrl+c` | quit |
+
+**Selecting diff lines** (after `v`)
+
+| Key | Action |
+| --- | --- |
+| `j` / `k`, `↓` / `↑` | extend the selection down / up |
+| `g` / `G`, `home` / `end` | extend to the first / last shown line |
+| `space` | restart the selection at the current line |
+| `d` | show the full diff hunk / only the commented lines |
+| `J` / `K`, `ctrl+d` / `ctrl+u` | scroll the pane |
+| `enter`, `Q`, `r` | reply with the selected lines quoted |
+| `esc`, `v`, `q` | back to browsing |
 
 **Replying**
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 
@@ -239,13 +240,13 @@ func TestDiffToggleShowsFullHunk(t *testing.T) {
 func TestDiffKeepsWholeMultiLineRange(t *testing.T) {
 	th := Thread{Path: "a.go", Line: line(17), StartLine: line(10)}
 	th.Comments.Nodes = []Comment{{DiffHunk: sampleHunk}}
-	if got := renderDiff(th, 80, false); strings.Contains(got, "⋮") {
+	if got := renderDiff(th, 80, false, nil); strings.Contains(got, "⋮") {
 		t.Errorf("an 8-line range should keep the whole hunk, got:\n%s", got)
 	}
 }
 
 func TestNoDiffWithoutHunk(t *testing.T) {
-	if got := renderDiff(fixture()[1], 80, false); got != "" {
+	if got := renderDiff(fixture()[1], 80, false, nil); got != "" {
 		t.Errorf("renderDiff = %q, want empty", got)
 	}
 }
@@ -300,5 +301,136 @@ func TestQuoteFenceAvoidsBackticksInCode(t *testing.T) {
 	th.Comments.Nodes = []Comment{{DiffHunk: "@@ -1 +1 @@\n+s := \"```\""}}
 	if got := quoteDiff(th, true); !strings.HasPrefix(got, "````diff\n") || !strings.HasSuffix(got, "\n````\n") {
 		t.Errorf("fence should be longer than any backtick run in the code, got %q", got)
+	}
+}
+
+func enter(m model) model {
+	n, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	return n.(model)
+}
+
+var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+// plain drops colour codes so styled spans next to each other can be matched.
+func plain(s string) string { return ansiEscape.ReplaceAllString(s, "") }
+
+// collapse makes quotes comparable regardless of how tabs were expanded.
+func collapse(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+func TestSelectStartsOnCommentedLine(t *testing.T) {
+	m := key(withHunk(t), "v")
+	if m.mode != modeDiff {
+		t.Fatal("v should enter line selection")
+	}
+	if got := m.selection(); got != (lineRange{7, 7}) {
+		t.Errorf("selection = %+v, want the last hunk line", got)
+	}
+	v := plain(m.View())
+	if !strings.Contains(v, "▌ +    }") {
+		t.Errorf("selected line should carry the gutter marker\n---\n%s", v)
+	}
+	if strings.Contains(v, "▌ +    if") {
+		t.Error("only the commented line should be selected at first")
+	}
+}
+
+func TestSelectMultiLineCommentPreselectsRange(t *testing.T) {
+	threads := fixture()
+	threads[0].Comments.Nodes[0].DiffHunk = sampleHunk
+	threads[0].StartLine, threads[0].Line = line(10), line(12)
+	m := newModel(nil, "o", "r", 1)
+	n, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	n, _ = n.Update(loadedMsg{threads: threads})
+	if got := key(n.(model), "v").selection(); got != (lineRange{5, 7}) {
+		t.Errorf("selection = %+v, want the 3 commented lines", got)
+	}
+}
+
+func TestSelectedLinesAreQuoted(t *testing.T) {
+	m := key(key(key(withHunk(t), "v"), "k"), "k")
+	m = enter(m)
+	if m.mode != modeReply {
+		t.Fatal("enter should open the reply")
+	}
+	want := "```diff\n+\tif x == nil {\n+\t\treturn nil\n+\t}\n```"
+	if got := m.reply.Value(); collapse(got) != collapse(want) {
+		t.Errorf("reply = %q, want %q", got, want)
+	}
+	if strings.Contains(m.View(), "▌") {
+		t.Error("selection markers should go away once replying")
+	}
+}
+
+func TestSpaceRestartsSelection(t *testing.T) {
+	m := key(key(key(key(withHunk(t), "v"), "k"), " "), "k")
+	if got := m.selection(); got != (lineRange{5, 6}) {
+		t.Errorf("selection = %+v, want {5 6}", got)
+	}
+}
+
+func TestSelectionStaysInShownLines(t *testing.T) {
+	m := key(withHunk(t), "v")
+	for range 10 {
+		m = key(m, "k")
+	}
+	if m.selCursor != 4 {
+		t.Errorf("compact view: cursor = %d, want 4 (first shown line)", m.selCursor)
+	}
+	m = key(m, "d")
+	for range 10 {
+		m = key(m, "k")
+	}
+	if m.selCursor != 0 {
+		t.Errorf("full hunk: cursor = %d, want 0", m.selCursor)
+	}
+	// Back to compact: both ends are pulled into the shown lines.
+	m = key(m, "d")
+	if got := m.selection(); got.from < 4 {
+		t.Errorf("selection %+v reaches lines the compact view hides", got)
+	}
+}
+
+func TestSelectEscReturnsToBrowse(t *testing.T) {
+	m := key(withHunk(t), "v")
+	n, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = n.(model)
+	if m.mode != modeBrowse {
+		t.Fatal("esc should leave line selection")
+	}
+	if strings.Contains(m.View(), "▌") {
+		t.Error("gutter should disappear after leaving selection")
+	}
+	if m.reply.Value() != "" {
+		t.Error("esc must not start a reply")
+	}
+}
+
+func TestSelectWithoutHunkWarns(t *testing.T) {
+	m := key(load(t), "v")
+	if m.mode != modeBrowse {
+		t.Error("v on a thread without a diff should stay in browse mode")
+	}
+	if !strings.Contains(m.View(), "no diff on this thread") {
+		t.Errorf("expected a warning in the footer, got:\n%s", m.View())
+	}
+}
+
+func TestSelectionCursorScrollsIntoView(t *testing.T) {
+	long := "@@ -1,60 +1,60 @@"
+	for i := range 60 {
+		long += "\n line " + string(rune('A'+i%26))
+	}
+	threads := fixture()
+	threads[0].Comments.Nodes[0].DiffHunk = long
+	m := newModel(nil, "o", "r", 1)
+	n, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 20})
+	n, _ = n.Update(loadedMsg{threads: threads})
+	m = key(key(n.(model), "d"), "v") // full hunk, cursor on the last line
+	if m.detail.YOffset == 0 {
+		t.Fatal("the pane should scroll down to the selection cursor")
+	}
+	m = key(m, "g")
+	if m.detail.YOffset > 3 {
+		t.Errorf("after g the pane should be back near the top, YOffset = %d", m.detail.YOffset)
 	}
 }
